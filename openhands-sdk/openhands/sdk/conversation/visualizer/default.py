@@ -21,6 +21,7 @@ from openhands.sdk.event import (
     UserRejectObservation,
 )
 from openhands.sdk.event.base import Event
+from openhands.sdk.event.conversation_error import ConversationErrorEvent
 from openhands.sdk.event.condenser import Condensation, CondensationRequest
 
 
@@ -187,6 +188,11 @@ EVENT_VISUALIZATION_CONFIG: dict[type[Event], EventVisualizationConfig] = {
     ),
     AgentErrorEvent: EventVisualizationConfig(
         title="Agent Error",
+        color=_ERROR_COLOR,
+        show_metrics=True,
+    ),
+    ConversationErrorEvent: EventVisualizationConfig(
+        title="Conversation Error",
         color=_ERROR_COLOR,
         show_metrics=True,
     ),
