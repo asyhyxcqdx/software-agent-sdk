@@ -113,6 +113,10 @@ class DockerWorkspace(RemoteWorkspace):
         default=False,
         description="Whether to enable GPU support with --gpus all.",
     )
+    user: str | None = Field(
+        default=None,
+        description="User to run the container as (e.g., '0:0' for root).",
+    )
     cleanup_image: bool = Field(
         default=False,
         description="Whether to delete the Docker image when cleaning up workspace.",
@@ -226,6 +230,9 @@ class DockerWorkspace(RemoteWorkspace):
         # Add GPU support if enabled
         if self.enable_gpu:
             flags += ["--gpus", "all"]
+
+        if self.user:
+            flags += ["--user", self.user]
 
         # Run container
         run_cmd = [
