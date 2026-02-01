@@ -61,7 +61,7 @@ RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         ca-certificates curl wget sudo apt-utils git jq tmux build-essential \
-        coreutils util-linux procps findutils grep sed \
+        coreutils util-linux procps findutils grep sed ripgrep \
         # Docker dependencies
         apt-transport-https gnupg lsb-release; \
     \
