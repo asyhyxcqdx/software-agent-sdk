@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -21,6 +22,7 @@ from openhands.sdk.tool import (
     ToolExecutor,
     register_tool,
 )
+
 
 
 @dataclass
@@ -55,6 +57,16 @@ class ValidatorExecutor(ToolExecutor[ValidatorAction, ValidatorObservation]):
         action: ValidatorAction,
         conversation=None,
     ) -> ValidatorObservation:  # noqa: ARG002
+        # Check /testbed state
+        testbed_error = _check_testbed_unchanged()
+        if testbed_error is not None:
+            _set_extra_info_status(action.extra_info_path, "failed")
+            return ValidatorObservation(
+                ok=False,
+                message=testbed_error,
+            )
+        
+        # Detect test script legality
         legal_check = None
         parse_failure_message = None
         if conversation is not None and hasattr(conversation, "ask_agent"):
@@ -74,7 +86,8 @@ class ValidatorExecutor(ToolExecutor[ValidatorAction, ValidatorObservation]):
                 ok=False,
                 message=parse_failure_message,
             )
-        
+
+        # Request host validation
         result = request_host_validation(
             dockerfile_path=action.dockerfile_path,
             test_script_path=action.test_script_path,
@@ -121,6 +134,85 @@ def _set_extra_info_status(extra_info_path: str, status: str) -> None:
         payload = {}
     payload["status"] = status
     path.write_text(json.dumps(payload, indent=2))
+
+
+def _check_testbed_unchanged() -> str | None:
+    base_commit_path = Path("/alpha/testbed_base_commit")
+    try:
+        baseline_commit = base_commit_path.read_text().strip()
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "Unable to verify /testbed state: baseline commit is missing. Please reinitialize the workspace."
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "Unable to verify /testbed state: baseline commit is missing. Please reinitialize the workspace."
+        ) from exc
+    if not baseline_commit:
+        raise RuntimeError(
+            "Unable to verify /testbed state: baseline commit is missing. Please reinitialize the workspace."
+        )
+    
+    try:
+        repo_check = _run_git(["rev-parse", "--is-inside-work-tree"])
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"Unable to verify /testbed state: git not found ({exc})."
+        ) from exc
+    if repo_check.returncode != 0:
+        raise RuntimeError(
+            f"Unable to verify /testbed state: not a git repository. {repo_check.stderr.strip()}"
+        )
+    
+    head = _run_git(["rev-parse", "HEAD"])
+    if head.returncode != 0:
+        raise RuntimeError(
+            f"Unable to verify /testbed state: failed to read HEAD. {head.stderr.strip()}"
+        )
+    status = _run_git(["status", "--porcelain"])
+    if status.returncode != 0:
+        raise RuntimeError(
+            f"Unable to verify /testbed state: failed to read status. {status.stderr.strip()}"
+        )
+    
+    head_value = head.stdout.strip()
+    status_value = status.stdout.strip()
+    if head_value != baseline_commit or status_value:
+        _restore_testbed(baseline_commit)
+        details = status_value or "(empty)"
+        message_lines = [
+            "Detected changes under /testbed and restored them.",
+            "git status --porcelain:",
+            details,
+        ]
+        if head_value != baseline_commit and not status_value:
+            message_lines.append(
+                f"Note: current HEAD={head_value} differs from baseline {baseline_commit}."
+            )
+        message_lines.extend(
+            [
+                "If the entries above were not intentionally modified or added by you, or you believe they do not affect the generated Dockerfile/run_tests.py, you may try calling the validator tool again.",
+                "If they were intentionally modified or added, please review your artifacts and ensure run_tests.py runs successfully locally before retrying.",
+            ]
+        )
+        return "\n".join(message_lines)
+    return None
+
+
+def _restore_testbed(baseline_commit: str) -> None:
+    _run_git(["checkout", "--detach", baseline_commit])
+    _run_git(["reset", "--hard", baseline_commit])
+    _run_git(["clean", "-fd"])
+    _run_git(["submodule", "update", "--init", "--recursive", "--depth", "1"])
+
+
+def _run_git(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(Path("/testbed")), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
 
 def _detect_test_script_legal(
