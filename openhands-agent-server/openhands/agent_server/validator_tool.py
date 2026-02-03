@@ -137,7 +137,7 @@ def _set_extra_info_status(extra_info_path: str, status: str) -> None:
 
 
 def _check_testbed_unchanged() -> str | None:
-    base_commit_path = Path("/alpha/testbed_base_commit")
+    base_commit_path = Path("/store/testbed_base_commit")
     try:
         baseline_commit = base_commit_path.read_text().strip()
     except FileNotFoundError as exc:
