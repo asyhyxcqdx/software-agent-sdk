@@ -14,7 +14,8 @@ FROM python:3.13-bullseye AS builder
 ARG USERNAME UID GID
 ENV UV_PROJECT_ENVIRONMENT=/agent-server/.venv
 ENV UV_PYTHON_INSTALL_DIR=/agent-server/uv-managed-python
-ENV UV_PYTHON_DOWNLOAD_MIRROR=https://ghfast.top/https://github.com/astral-sh/python-build-standalone/releases/download
+ENV UV_PYTHON_INSTALL_MIRROR=https://ghfast.top/https://github.com/astral-sh/python-build-standalone/releases/download
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 
 COPY --from=ghcr.io/astral-sh/uv /uv /uvx /bin/
 
@@ -117,7 +118,7 @@ RUN set -eux; \
     fi; \
     \
     # Download and install VSCode Server
-    wget https://github.com/${RELEASE_ORG}/openvscode-server/releases/download/${RELEASE_TAG}/${RELEASE_TAG}-linux-${arch}.tar.gz; \
+    wget https://ghfast.top/https://github.com/${RELEASE_ORG}/openvscode-server/releases/download/${RELEASE_TAG}/${RELEASE_TAG}-linux-${arch}.tar.gz; \
     tar -xzf ${RELEASE_TAG}-linux-${arch}.tar.gz; \
     if [ -d "${OPENVSCODE_SERVER_ROOT}" ]; then rm -rf "${OPENVSCODE_SERVER_ROOT}"; fi; \
     mv ${RELEASE_TAG}-linux-${arch} ${OPENVSCODE_SERVER_ROOT}; \
