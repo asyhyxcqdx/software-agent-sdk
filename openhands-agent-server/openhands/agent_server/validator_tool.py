@@ -218,7 +218,7 @@ def _check_testbed_unchanged() -> str | None:
         _restore_testbed(baseline_commit)
         details = status_value or "(empty)"
         message_lines = [
-            "Detected changes under /testbed and restored them.",
+            "We detected changes under /testbed and restored them.",
             "git status --porcelain:",
             details,
         ]
@@ -275,6 +275,7 @@ def _detect_test_script_legal(
     
     had_error = False
     last_error: str | None = None
+    last_response: str | None = None
     for prompt in (base_prompt, retry_prompt, retry_prompt):
         try:
             response = conversation.ask_agent(prompt)
@@ -282,6 +283,7 @@ def _detect_test_script_legal(
             had_error = True
             last_error = str(exc)
             continue
+        last_response = response
         parsed = _parse_legal_response(response)
         if parsed is not None:
             return parsed[0], parsed[1], None
@@ -292,6 +294,14 @@ def _detect_test_script_legal(
             None,
             "please ensure the passed test files and failed test files in your test script are generated from actual test execution. "
             f"ask_agent error: {last_error}",
+        )
+    if last_response is not None:
+        preview = last_response.strip() or "(empty response)"
+        return (
+            None,
+            None,
+            "Failed to parse ask_agent response. Please ensure the passed test files and failed test files in your test script are generated from actual test execution. "
+            f"ask_agent response: {preview}",
         )
     # Analysis failed. Returning a generic response.
     return (
