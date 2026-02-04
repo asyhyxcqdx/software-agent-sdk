@@ -33,6 +33,7 @@ _VALIDATOR_CALL_LOCK = threading.Lock()
 class ValidationResult:
     ok: bool
     message: str
+    dockerfile_text: str | None = None
 
 
 class ValidatorAction(Action):
@@ -113,6 +114,15 @@ class ValidatorExecutor(ToolExecutor[ValidatorAction, ValidatorObservation]):
             status="success" if result.ok else "failed",
         )
         if result.ok and conversation is not None:
+            if result.dockerfile_text:
+                try:
+                    Path(action.dockerfile_path).write_text(result.dockerfile_text)
+                except Exception as exc:  # noqa: BLE001
+                    _update_extra_info(action.extra_info_path, status="failed")
+                    return ValidatorObservation(
+                        ok=False,
+                        message=f"Validation succeeded but failed to update Dockerfile: {exc}",
+                    )
             conversation.state.execution_status = ConversationExecutionStatus.FINISHED
         return ValidatorObservation(
             ok=result.ok,
@@ -369,6 +379,7 @@ def request_host_validation(
     return ValidationResult(
         bool(data.get("ok")),
         str(data.get("message", "")),
+        data.get("dockerfile") if isinstance(data.get("dockerfile"), str) else None,
     )
 
 
