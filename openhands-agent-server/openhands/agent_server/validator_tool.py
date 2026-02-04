@@ -64,7 +64,7 @@ class ValidatorExecutor(ToolExecutor[ValidatorAction, ValidatorObservation]):
         # Check /testbed state
         testbed_error = _check_testbed_unchanged()
         if testbed_error is not None:
-            _set_extra_info_status(action.extra_info_path, "failed")
+            _update_extra_info(action.extra_info_path, status="failed")
             return ValidatorObservation(
                 ok=False,
                 message=testbed_error,
@@ -72,20 +72,27 @@ class ValidatorExecutor(ToolExecutor[ValidatorAction, ValidatorObservation]):
         
         # Detect test script legality
         legal_check = None
+        legal_reason = None
         parse_failure_message = None
         if conversation is not None and hasattr(conversation, "ask_agent"):
-            legal_check, parse_failure_message = _detect_test_script_legal(
+            legal_check, legal_reason, parse_failure_message = _detect_test_script_legal(
                 conversation,
                 action.test_script_path,
             )
+        if legal_check is not None:
+            _update_extra_info(
+                action.extra_info_path,
+                legal=legal_check,
+                reason=legal_reason,
+            )
         if legal_check is False:
-            _set_extra_info_status(action.extra_info_path, "failed")
+            _update_extra_info(action.extra_info_path, status="failed")
             return ValidatorObservation(
                 ok=False,
                 message="Illegal test script detected. Ensure run_tests.py passed/failed test files are generated from actual test execution and supports --input/--output.",
             )
         if parse_failure_message is not None:
-            _set_extra_info_status(action.extra_info_path, "failed")
+            _update_extra_info(action.extra_info_path, status="failed")
             return ValidatorObservation(
                 ok=False,
                 message=parse_failure_message,
@@ -101,8 +108,9 @@ class ValidatorExecutor(ToolExecutor[ValidatorAction, ValidatorObservation]):
             host_task_dir=host_task_dir,
             call_count=call_count,
         )
-        _set_extra_info_status(
-            action.extra_info_path, "success" if result.ok else "failed"
+        _update_extra_info(
+            action.extra_info_path,
+            status="success" if result.ok else "failed",
         )
         if result.ok and conversation is not None:
             conversation.state.execution_status = ConversationExecutionStatus.FINISHED
@@ -133,14 +141,25 @@ class ValidatorTool(ToolDefinition[ValidatorAction, ValidatorObservation]):
         ]
 
 
-def _set_extra_info_status(extra_info_path: str, status: str) -> None:
+def _update_extra_info(
+    extra_info_path: str,
+    *,
+    status: str | None = None,
+    legal: bool | None = None,
+    reason: str | None = None,
+) -> None:
     path = Path(extra_info_path)
     payload: dict[str, Any]
     try:
         payload = json.loads(path.read_text()) if path.exists() else {}
     except Exception:  # noqa: BLE001
         payload = {}
-    payload["status"] = status
+    if status is not None:
+        payload["status"] = status
+    if legal is not None:
+        payload["legal"] = bool(legal)
+    if reason is not None:
+        payload["reason"] = reason
     path.write_text(json.dumps(payload, indent=2))
 
 
@@ -225,11 +244,11 @@ def _run_git(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
 
 def _detect_test_script_legal(
     conversation, test_script_path: str
-) -> tuple[bool | None, str | None]:
+) -> tuple[bool | None, str | None, str | None]:
     try:
         test_script_text = Path(test_script_path).read_text()
     except Exception:  # noqa: BLE001
-        return None, None
+        return None, None, None
 
     base_prompt = "You are reviewing a test script used to produce passed/failed test files. You must judge two things:\n" \
         "1. Cheating: The script produces those lists without actually running tests (e.g., hardcoded lists, cached outputs, or placeholders). It also includes any case where files exist but were not produced by a real test run; if the script does not clearly run tests and derive the lists from results, treat it as cheating.\n" \
@@ -253,21 +272,23 @@ def _detect_test_script_legal(
             continue
         parsed = _parse_legal_response(response)
         if parsed is not None:
-            return parsed, None
+            return parsed[0], parsed[1], None
     # Calling ask_agent() failed, returning a generic response
     if had_error:
         return (
+            None,
             None,
             "please ensure the passed test files and failed test files in your test script are generated from actual test execution.",
         )
     # Analysis failed. Returning a generic response.
     return (
         None,
+        None,
         "Please ensure the passed test files and failed test files in your test script are generated from actual test execution.",
     )
 
 
-def _parse_legal_response(response: str) -> bool | None:
+def _parse_legal_response(response: str) -> tuple[bool, str | None] | None:
     response = response.strip()
     if not response:
         return None
@@ -288,14 +309,16 @@ def _parse_legal_response(response: str) -> bool | None:
     if not isinstance(payload, dict):
         return None
     legal_value = payload.get("legal")
+    reason_value = payload.get("reason")
+    reason_text = reason_value if isinstance(reason_value, str) else None
     if isinstance(legal_value, bool):
-        return legal_value
+        return legal_value, reason_text
     if isinstance(legal_value, str):
         normalized = legal_value.strip().lower()
         if normalized in {"true", "yes", "1", "correct", "legal", "true."}:
-            return True
+            return True, reason_text
         if normalized in {"false", "no", "0", "incorrect", "illegal", "false."}:
-            return False
+            return False, reason_text
     return None
 
 
