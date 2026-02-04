@@ -13,9 +13,10 @@ _TARGET_PATH = Path("/output/run_tests.py").resolve()
 REMINDER_TEXT = (
     "Reminder: /output/run_tests.py has been modified 3 times. "
     "FOCUS ON THE PRIMARY GOAL: get a runnable environment, make sure "
-    "run_tests.py exits normally, and ensure 'passed test files' contains a "
+    "run_tests.py EXITS NORMALLY, and ensure 'passed test files' contains a "
     "reasonable number of unit tests. That's enough. "
-    "DO NOT get stuck on a small number of failed test files or their root causes."
+    "DO NOT get stuck on a small number of failed test files or their root causes. "
+    "It is okay to leave the failed test list as-is."
 )
 
 
