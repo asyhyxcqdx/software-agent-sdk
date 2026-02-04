@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -22,6 +23,9 @@ from openhands.sdk.tool import (
     ToolExecutor,
     register_tool,
 )
+
+_VALIDATOR_CALL_COUNT = 0
+_VALIDATOR_CALL_LOCK = threading.Lock()
 
 
 
@@ -88,10 +92,14 @@ class ValidatorExecutor(ToolExecutor[ValidatorAction, ValidatorObservation]):
             )
 
         # Request host validation
+        host_task_dir = _read_host_task_dir()
+        call_count = _next_validator_call_count()
         result = request_host_validation(
             dockerfile_path=action.dockerfile_path,
             test_script_path=action.test_script_path,
             extra_info_path=action.extra_info_path,
+            host_task_dir=host_task_dir,
+            call_count=call_count,
         )
         _set_extra_info_status(
             action.extra_info_path, "success" if result.ok else "failed"
@@ -296,6 +304,8 @@ def request_host_validation(
     dockerfile_path: str,
     test_script_path: str,
     extra_info_path: str,
+    host_task_dir: str | None = None,
+    call_count: int | None = None,
     timeout_seconds: int | None = None,
 ) -> ValidationResult:
     try:
@@ -309,6 +319,8 @@ def request_host_validation(
         "dockerfile": dockerfile_text,
         "test_script": test_script_text,
         "extra_info": extra_info_text,
+        "host_task_dir": host_task_dir or "",
+        "call_count": call_count or 0,
     }
 
     host_gateway_ip = os.getenv("HOST_GATEWAY_IP", "172.17.0.1")
@@ -339,6 +351,24 @@ def request_host_validation(
 
 def register_validator_tool() -> None:
     register_tool("validator", ValidatorTool.create)
+
+
+def _read_host_task_dir() -> str | None:
+    path = Path("/store/host_task_dir")
+    try:
+        value = path.read_text().strip()
+    except FileNotFoundError:
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+    return value or None
+
+
+def _next_validator_call_count() -> int:
+    global _VALIDATOR_CALL_COUNT
+    with _VALIDATOR_CALL_LOCK:
+        _VALIDATOR_CALL_COUNT += 1
+        return _VALIDATOR_CALL_COUNT
 
 
 # Ensure tool is registered when module is imported on the client side
