@@ -15,9 +15,18 @@ ARG USERNAME UID GID
 ENV UV_PROJECT_ENVIRONMENT=/agent-server/.venv
 ENV UV_PYTHON_INSTALL_DIR=/agent-server/uv-managed-python
 ENV UV_PYTHON_INSTALL_MIRROR=https://ghfast.top/https://github.com/astral-sh/python-build-standalone/releases/download
+ENV UV_CONFIG_FILE=/etc/uv/uv.toml
 ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 
 COPY --from=ghcr.io/astral-sh/uv /uv /uvx /bin/
+
+RUN mkdir -p /etc/uv \
+ && cat > /etc/uv/uv.toml <<'EOF'
+python-install-mirror = "https://ghfast.top/https://github.com/astral-sh/python-build-standalone/releases/download"
+[[index]]
+url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/"
+default = true
+EOF
 
 RUN groupadd -g ${GID} ${USERNAME} \
  && useradd -m -u ${UID} -g ${GID} -s /usr/sbin/nologin ${USERNAME}
