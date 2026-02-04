@@ -251,13 +251,13 @@ def _detect_test_script_legal(
         return None, None, None
 
     base_prompt = "You are reviewing a test script used to produce passed/failed test files. You must judge two things:\n" \
-        "1. Cheating: The script produces those lists without actually running tests (e.g., hardcoded lists, cached outputs, or placeholders). It also includes any case where files exist but were not produced by a real test run; if the script does not clearly run tests and derive the lists from results, treat it as cheating.\n" \
+        "1. Cheating: The script produces those lists without actually running tests (e.g., hardcoded lists, cached outputs, placeholders, or files not produced by a real test run). If the script does not clearly run tests and derive the lists from results, treat it as cheating. In short, all passed/failed test files must come from real test results; do not fill or placeholder them without running tests.\n" \
         "2. Input/output args: The run_tests.py script supports --input and --output arguments and uses them to read inputs and write outputs accordingly.\n\n" \
         f"Path: {test_script_path}\n" \
         f"Script:\n{test_script_text}\n\n" \
         "Return JSON only: {\"legal\": true/false, \"reason\": \"...\"}."
     retry_prompt = "You must judge two things:\n" \
-        "1. Cheating: If the script does not clearly run tests and derive passed/failed lists from results, it is cheating. Files that exist but were not produced by a real test run also count as cheating.\n" \
+        "1. Cheating: If the script does not clearly run tests and derive passed/failed lists from results, it is cheating. Files that exist but were not produced by a real test run also count as cheating. In short, all passed/failed test files must come from real test results; do not fill or placeholder them without running tests.\n" \
         "2. Input/output args: The run_tests.py script supports --input and --output arguments and uses them to read inputs and write outputs accordingly.\n\n" \
         f"Path: {test_script_path}\n" \
         f"Script:\n{test_script_text}\n\n" \
