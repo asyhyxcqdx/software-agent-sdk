@@ -12,6 +12,7 @@ from openhands.tools.terminal.definition import (
     TerminalAction,
     TerminalObservation,
 )
+from openhands.tools.terminal.metadata import CmdOutputMetadata
 from openhands.tools.terminal.terminal.factory import create_terminal_session
 from openhands.tools.terminal.terminal.terminal_session import TerminalSession
 
@@ -137,6 +138,28 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
         action: TerminalAction,
         conversation: "LocalConversation | None" = None,
     ) -> TerminalObservation:
+        if (
+            action.command
+            and not action.is_input
+            and not action.reset
+            and self._uses_official_pytorch_download(action.command)
+        ):
+            return TerminalObservation.from_text(
+                text=(
+                    "If you are pip install using the official PyTorch download URL now, "
+                    "please use a mirror source instead, e.g.\n"
+                    "- pip install torch==<TORCH_VERSION> torchvision==<VISION_VERSION> "
+                    "torchaudio==<AUDIO_VERSION> -f https://mirrors.aliyun.com/pytorch-wheels/cu<CUDA_VERSION>\n"
+                    "- For CPU-only: pip install torch==<TORCH_VERSION> torchvision==<VISION_VERSION> "
+                    "torchaudio==<AUDIO_VERSION> -f https://mirrors.aliyun.com/pytorch-wheels/cpu/"
+                    "Otherwise, please ignore this message."
+                ),
+                command=action.command,
+                metadata=CmdOutputMetadata(exit_code=1),
+                exit_code=1,
+                is_error=True,
+            )
+
         # Validate field combinations
         if action.reset and action.is_input:
             raise ValueError("Cannot use reset=True with is_input=True")
@@ -194,6 +217,15 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                 pass
 
         return observation
+
+    @staticmethod
+    def _uses_official_pytorch_download(command: str) -> bool:
+        lowered = command.lower()
+        return (
+            "pip" in lowered
+            and "install" in lowered
+            and "download.pytorch" in lowered
+        )
 
     def close(self) -> None:
         """Close the terminal session and clean up resources."""

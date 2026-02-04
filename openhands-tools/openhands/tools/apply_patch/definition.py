@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import Field
 
+from openhands.sdk.llm import TextContent
 from openhands.sdk.tool import (
     Action,
     Observation,
@@ -19,6 +20,7 @@ from openhands.sdk.tool import (
 from openhands.sdk.tool.tool import FunctionToolParam
 
 from .core import Commit, DiffError, process_patch
+from openhands.tools.utils.run_tests_guard import REMINDER_TEXT, record_run_tests_edit
 
 
 if TYPE_CHECKING:
@@ -84,7 +86,7 @@ class ApplyPatchExecutor(ToolExecutor[ApplyPatchAction, ApplyPatchObservation]):
     def __call__(
         self,
         action: ApplyPatchAction,
-        conversation=None,  # noqa: ARG002 - signature match
+        conversation=None,
     ) -> ApplyPatchObservation:
         """Execute the patch application and return an observation."""
 
@@ -115,6 +117,15 @@ class ApplyPatchExecutor(ToolExecutor[ApplyPatchAction, ApplyPatchObservation]):
                 obs = ApplyPatchObservation.from_text(
                     text=msg, message=msg, fuzz=fuzz, commit=commit, is_error=False
                 )
+            if commit and commit.changes:
+                for path in commit.changes:
+                    resolved = self._resolve_path(path)
+                    if record_run_tests_edit(resolved, conversation):
+                        reminder = TextContent(text=f"\n\n{REMINDER_TEXT}")
+                        obs = obs.model_copy(
+                            update={"content": list(obs.content) + [reminder]}
+                        )
+                        break
             return obs
         except DiffError as e:
             return ApplyPatchObservation.from_text(text=str(e), is_error=True)

@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from openhands.sdk.llm import TextContent
 from openhands.sdk.tool import ToolExecutor
 
 
@@ -13,6 +14,7 @@ from openhands.tools.file_editor.definition import (
 )
 from openhands.tools.file_editor.editor import FileEditor
 from openhands.tools.file_editor.exceptions import ToolError
+from openhands.tools.utils.run_tests_guard import REMINDER_TEXT, record_run_tests_edit
 
 
 # Module-global editor instance (lazily initialized in file_editor)
@@ -70,6 +72,19 @@ class FileEditorExecutor(ToolExecutor):
                 text=e.message, command=action.command, is_error=True
             )
         assert result is not None, "file_editor should always return a result"
+        if (
+            not result.is_error
+            and action.command in {"create", "str_replace", "insert", "undo_edit"}
+        ):
+            try:
+                edited_path = Path(result.path or action.path).resolve()
+            except Exception:
+                edited_path = None
+            if edited_path and record_run_tests_edit(edited_path, conversation):
+                reminder = TextContent(text=f"\n\n{REMINDER_TEXT}")
+                result = result.model_copy(
+                    update={"content": list(result.content) + [reminder]}
+                )
         return result
 
 
