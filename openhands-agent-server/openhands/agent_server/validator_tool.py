@@ -274,11 +274,13 @@ def _detect_test_script_legal(
         "Return JSON only. No extra text. Format: {\"legal\": true/false, \"reason\": \"...\"}."
     
     had_error = False
+    last_error: str | None = None
     for prompt in (base_prompt, retry_prompt, retry_prompt):
         try:
             response = conversation.ask_agent(prompt)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             had_error = True
+            last_error = str(exc)
             continue
         parsed = _parse_legal_response(response)
         if parsed is not None:
@@ -288,7 +290,8 @@ def _detect_test_script_legal(
         return (
             None,
             None,
-            "please ensure the passed test files and failed test files in your test script are generated from actual test execution.",
+            "please ensure the passed test files and failed test files in your test script are generated from actual test execution. "
+            f"ask_agent error: {last_error}",
         )
     # Analysis failed. Returning a generic response.
     return (
