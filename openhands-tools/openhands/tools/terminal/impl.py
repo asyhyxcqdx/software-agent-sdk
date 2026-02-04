@@ -221,11 +221,15 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
     @staticmethod
     def _uses_official_pytorch_download(command: str) -> bool:
         lowered = command.lower()
-        return (
-            "pip" in lowered
-            and "install" in lowered
-            and "download.pytorch" in lowered
-        )
+        if "pip" not in lowered or "install" not in lowered:
+            return False
+        if "download.pytorch" in lowered:
+            return True
+        if "--index-url https://mirrors.aliyun.com/pytorch-wheels/" in lowered:
+            return False
+        if "-i https://mirrors.aliyun.com/pytorch-wheels/" in lowered:
+            return False
+        return False
 
     def close(self) -> None:
         """Close the terminal session and clean up resources."""
