@@ -14,6 +14,7 @@ FROM python:3.13-bullseye AS builder
 ARG USERNAME UID GID
 ENV UV_PROJECT_ENVIRONMENT=/agent-server/.venv
 ENV UV_PYTHON_INSTALL_DIR=/agent-server/uv-managed-python
+ENV UV_PYTHON_DOWNLOAD_MIRROR=https://ghfast.top/https://github.com/astral-sh/python-build-standalone/releases/download
 
 COPY --from=ghcr.io/astral-sh/uv /uv /uvx /bin/
 
