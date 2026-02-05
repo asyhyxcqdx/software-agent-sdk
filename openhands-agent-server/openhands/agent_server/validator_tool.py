@@ -28,18 +28,25 @@ _VALIDATOR_CALL_COUNT = 0
 _VALIDATOR_CALL_LOCK = threading.Lock()
 
 
-
 @dataclass
 class ValidationResult:
     ok: bool
     message: str
     dockerfile_text: str | None = None
+    used_image_name: str | None = None
+    image_history: list[str] | None = None
 
 
 class ValidatorAction(Action):
     dockerfile_path: str = Field(description="Path to Dockerfile")
     test_script_path: str = Field(description="Path to Python test script")
     extra_info_path: str = Field(description="Path to extra info JSON")
+    image_name: str = Field(
+        description=(
+            "Image selector for validation. Use 'scratch' to build a new image, "
+            "or provide an existing image name to reuse."
+        ),
+    )
 
 
 class ValidatorObservation(Observation):
@@ -57,20 +64,81 @@ class ValidatorObservation(Observation):
 
 
 class ValidatorExecutor(ToolExecutor[ValidatorAction, ValidatorObservation]):
+    def __init__(self) -> None:
+        self._tracked_image_names: set[str] = set()
+        self._tracked_lock = threading.Lock()
+
+    def _track_image_names(self, image_names: list[str]) -> None:
+        if not image_names:
+            return
+        with self._tracked_lock:
+            for image_name in image_names:
+                normalized = image_name.strip()
+                if normalized:
+                    self._tracked_image_names.add(normalized)
+
+    def _flush_tracked_images(self, host_task_dir: str) -> None:
+        with self._tracked_lock:
+            image_names = sorted(self._tracked_image_names)
+        if not image_names:
+            return
+
+        payload = {
+            "image_names": image_names,
+            "host_task_dir": host_task_dir,
+        }
+        host_gateway_ip = os.getenv("HOST_GATEWAY_IP", "172.17.0.1")
+        timeout_seconds = int(os.getenv("VALIDATOR_TOOL_REQUEST_TIMEOUT", "1800"))
+        port = int(os.getenv("VALIDATOR_PORT", "9090"))
+        url = f"http://{host_gateway_ip}:{port}/cleanup_images"
+
+        try:
+            request = Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(request, timeout=timeout_seconds):
+                pass
+            with self._tracked_lock:
+                self._tracked_image_names.difference_update(image_names)
+        except Exception:  # noqa: BLE001
+            return
+
+    @staticmethod
+    def _build_observation(
+        *,
+        ok: bool,
+        message: str,
+        used_image_name: str | None,
+    ) -> ValidatorObservation:
+        used_name = used_image_name.strip() if isinstance(used_image_name, str) else ""
+        if not used_name:
+            used_name = "N/A"
+        suffix = f"Image used for this validate: {used_name}"
+        return ValidatorObservation(
+            ok=ok,
+            message=suffix if not message.rstrip() else f"{message.rstrip()}\n{suffix}",
+        )
+
     def __call__(
         self,
         action: ValidatorAction,
         conversation=None,
     ) -> ValidatorObservation:  # noqa: ARG002
+        image_name = action.image_name.strip()
+
         # Check /testbed state
         testbed_error = _check_testbed_unchanged()
         if testbed_error is not None:
             _update_extra_info(action.extra_info_path, status="failed")
-            return ValidatorObservation(
+            return self._build_observation(
                 ok=False,
                 message=testbed_error,
+                used_image_name=None,
             )
-        
+
         # Detect test script legality
         legal_check = None
         legal_reason = None
@@ -88,19 +156,29 @@ class ValidatorExecutor(ToolExecutor[ValidatorAction, ValidatorObservation]):
             )
         if legal_check is False:
             _update_extra_info(action.extra_info_path, status="failed")
-            return ValidatorObservation(
+            return self._build_observation(
                 ok=False,
                 message="Illegal test script detected. Ensure run_tests.py passed/failed test files are generated from actual test execution and supports --input/--output.",
+                used_image_name=None,
             )
         if parse_failure_message is not None:
             _update_extra_info(action.extra_info_path, status="failed")
-            return ValidatorObservation(
+            return self._build_observation(
                 ok=False,
                 message=parse_failure_message,
+                used_image_name=None,
             )
 
         # Request host validation
-        host_task_dir = _read_host_task_dir()
+        try:
+            host_task_dir = _read_host_task_dir()
+        except RuntimeError as exc:
+            _update_extra_info(action.extra_info_path, status="failed")
+            return self._build_observation(
+                ok=False,
+                message=str(exc),
+                used_image_name=None,
+            )
         call_count = _next_validator_call_count()
         result = request_host_validation(
             dockerfile_path=action.dockerfile_path,
@@ -108,7 +186,15 @@ class ValidatorExecutor(ToolExecutor[ValidatorAction, ValidatorObservation]):
             extra_info_path=action.extra_info_path,
             host_task_dir=host_task_dir,
             call_count=call_count,
+            image_name=image_name,
         )
+        # Only track images when image_name is scratch and an image name is actually returned (indicating the build succeeded), then delete them in bulk when this task ends.
+        cleanup_candidates: list[str] = []
+        if image_name.lower() == "scratch" and result.used_image_name:
+            cleanup_candidates.append(result.used_image_name)
+        if result.image_history:
+            cleanup_candidates.extend(result.image_history)
+        self._track_image_names(cleanup_candidates)
         _update_extra_info(
             action.extra_info_path,
             status="success" if result.ok else "failed",
@@ -119,15 +205,24 @@ class ValidatorExecutor(ToolExecutor[ValidatorAction, ValidatorObservation]):
                     Path(action.dockerfile_path).write_text(result.dockerfile_text)
                 except Exception as exc:  # noqa: BLE001
                     _update_extra_info(action.extra_info_path, status="failed")
-                    return ValidatorObservation(
+                    return self._build_observation(
                         ok=False,
                         message=f"Validation succeeded but failed to update Dockerfile: {exc}",
+                        used_image_name=result.used_image_name,
                     )
             conversation.state.execution_status = ConversationExecutionStatus.FINISHED
-        return ValidatorObservation(
+        return self._build_observation(
             ok=result.ok,
             message=result.message,
+            used_image_name=result.used_image_name,
         )
+
+    def close(self) -> None:
+        try:
+            host_task_dir = _read_host_task_dir()
+        except RuntimeError:
+            return
+        self._flush_tracked_images(host_task_dir)
 
 
 class ValidatorTool(ToolDefinition[ValidatorAction, ValidatorObservation]):
@@ -142,7 +237,10 @@ class ValidatorTool(ToolDefinition[ValidatorAction, ValidatorObservation]):
                     "test runner locally and verify the result file format is "
                     "correct. This tool triggers a host-side image build and test "
                     "execution, which is expensive and slow. DO NOT call it unless "
-                    "you are absolutely certain the local validation is correct."
+                    "you are absolutely certain the local validation is correct. "
+                    "You MUST provide image_name: use 'scratch' to build a new "
+                    "image, or provide an existing image name to reuse and skip "
+                    "rebuilding."
                 ),
                 action_type=ValidatorAction,
                 observation_type=ValidatorObservation,
@@ -171,7 +269,6 @@ def _update_extra_info(
     if reason is not None:
         payload["reason"] = reason
     path.write_text(json.dumps(payload, indent=2))
-
 
 def _check_testbed_unchanged() -> str | None:
     base_commit_path = Path("/store/testbed_base_commit")
@@ -350,8 +447,9 @@ def request_host_validation(
     dockerfile_path: str,
     test_script_path: str,
     extra_info_path: str,
-    host_task_dir: str | None = None,
+    host_task_dir: str,
     call_count: int | None = None,
+    image_name: str,
     timeout_seconds: int | None = None,
 ) -> ValidationResult:
     try:
@@ -365,8 +463,9 @@ def request_host_validation(
         "dockerfile": dockerfile_text,
         "test_script": test_script_text,
         "extra_info": extra_info_text,
-        "host_task_dir": host_task_dir or "",
+        "host_task_dir": host_task_dir,
         "call_count": call_count or 0,
+        "image_name": image_name,
     }
 
     host_gateway_ip = os.getenv("HOST_GATEWAY_IP", "172.17.0.1")
@@ -393,6 +492,16 @@ def request_host_validation(
         bool(data.get("ok")),
         str(data.get("message", "")),
         data.get("dockerfile") if isinstance(data.get("dockerfile"), str) else None,
+        data.get("used_image_name")
+        if isinstance(data.get("used_image_name"), str)
+        else None,
+        [
+            value
+            for value in data.get("image_history", [])
+            if isinstance(value, str)
+        ]
+        if isinstance(data.get("image_history"), list)
+        else None,
     )
 
 
@@ -400,15 +509,17 @@ def register_validator_tool() -> None:
     register_tool("validator", ValidatorTool.create)
 
 
-def _read_host_task_dir() -> str | None:
+def _read_host_task_dir() -> str:
     path = Path("/store/host_task_dir")
     try:
         value = path.read_text().strip()
     except FileNotFoundError:
-        return None
-    except Exception:  # noqa: BLE001
-        return None
-    return value or None
+        raise RuntimeError("Missing required /store/host_task_dir; cannot call validator.")
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Failed to read /store/host_task_dir: {exc}") from exc
+    if not value:
+        raise RuntimeError("Empty /store/host_task_dir; cannot call validator.")
+    return value
 
 
 def _next_validator_call_count() -> int:

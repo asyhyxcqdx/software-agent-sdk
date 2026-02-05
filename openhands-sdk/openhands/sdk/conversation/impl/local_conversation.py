@@ -770,7 +770,7 @@ class LocalConversation(BaseConversation):
                 update={
                     "usage_id": "ask-agent-llm",
                 },
-                deep=True,
+                deep=False,
             )
             self.llm_registry.add(question_llm)
 
