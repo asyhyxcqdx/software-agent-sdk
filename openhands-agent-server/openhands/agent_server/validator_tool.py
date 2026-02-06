@@ -155,10 +155,12 @@ class ValidatorExecutor(ToolExecutor[ValidatorAction, ValidatorObservation]):
                 reason=legal_reason,
             )
         if legal_check is False:
+            reason = f" Reason: {legal_reason}" if legal_reason else ""
             _update_extra_info(action.extra_info_path, status="failed")
             return self._build_observation(
                 ok=False,
-                message="Illegal test script detected. Ensure run_tests.py passed/failed test files are generated from actual test execution and supports --input/--output.",
+                message="Illegal test script detected.\n"
+                f"{reason}",
                 used_image_name=None,
             )
         if parse_failure_message is not None:
@@ -357,23 +359,22 @@ def _detect_test_script_legal(
     except Exception:  # noqa: BLE001
         return None, None, None
 
-    base_prompt = "You are reviewing a test script used to produce passed/failed test files. You must judge two things:\n" \
-        "1. Cheating: The script produces those lists without actually running tests (e.g., hardcoded lists, cached outputs, placeholders, or files not produced by a real test run). If the script does not clearly run tests and derive the lists from results, treat it as cheating. In short, all passed/failed test files must come from real test results; do not fill or placeholder them without running tests.\n" \
-        "2. Input/output args: The run_tests.py script supports --input and --output arguments and uses them to read inputs and write outputs accordingly.\n\n" \
+    base_prompt = "You are reviewing run_tests.py. Decide if it is legal.\n" \
+        "Rules:\n" \
+        "1) It must actually execute the repo's real unit tests (via a real test framework like pytest/unittest, OR direct invocation of real test_* functions) and derive passed/failed lists from actual outcomes.\n" \
+        "2) Any failing test must be recorded as failed (or cause overall failure). Swallowing failures is cheating. Examples of cheating:\n" \
+        "   - Catching exceptions from test_* calls without re-raising AND without recording failure.\n" \
+        "   - Unconditionally appending a test file to passed even if a test failed.\n" \
+        "   - Hardcoding or fabricating passed/failed lists.\n" \
+        "3) It must support --input/--output and use them to read inputs and write outputs.\n\n" \
         f"Path: {test_script_path}\n" \
         f"Script:\n{test_script_text}\n\n" \
         "Return JSON only: {\"legal\": true/false, \"reason\": \"...\"}."
-    retry_prompt = "You must judge two things:\n" \
-        "1. Cheating: If the script does not clearly run tests and derive passed/failed lists from results, it is cheating. Files that exist but were not produced by a real test run also count as cheating. In short, all passed/failed test files must come from real test results; do not fill or placeholder them without running tests.\n" \
-        "2. Input/output args: The run_tests.py script supports --input and --output arguments and uses them to read inputs and write outputs accordingly.\n\n" \
-        f"Path: {test_script_path}\n" \
-        f"Script:\n{test_script_text}\n\n" \
-        "Return JSON only. No extra text. Format: {\"legal\": true/false, \"reason\": \"...\"}."
     
     had_error = False
     last_error: str | None = None
     last_response: str | None = None
-    for prompt in (base_prompt, retry_prompt, retry_prompt):
+    for prompt in (base_prompt, base_prompt, base_prompt):
         try:
             response = conversation.ask_agent(prompt)
         except Exception as exc:  # noqa: BLE001
