@@ -270,6 +270,12 @@ def _update_extra_info(
         payload["legal"] = bool(legal)
     if reason is not None:
         payload["reason"] = reason
+    timeout_env = os.getenv("RUN_TESTS_TIMEOUT")
+    if timeout_env:
+        try:
+            payload["run_tests_timeout"] = int(timeout_env)
+        except ValueError:
+            pass
     path.write_text(json.dumps(payload, indent=2))
 
 def _check_testbed_unchanged() -> str | None:
