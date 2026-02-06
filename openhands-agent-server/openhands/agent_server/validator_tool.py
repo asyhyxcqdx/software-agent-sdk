@@ -36,6 +36,7 @@ class ValidationResult:
     dockerfile_text: str | None = None
     used_image_name: str | None = None
     image_history: list[str] | None = None
+    passed_num: int | None = None
 
 
 class ValidatorAction(Action):
@@ -200,6 +201,7 @@ class ValidatorExecutor(ToolExecutor[ValidatorAction, ValidatorObservation]):
         _update_extra_info(
             action.extra_info_path,
             status="success" if result.ok else "failed",
+            passed_num=result.passed_num if result.ok else None,
         )
         if result.ok and conversation is not None:
             if result.dockerfile_text:
@@ -257,6 +259,7 @@ def _update_extra_info(
     status: str | None = None,
     legal: bool | None = None,
     reason: str | None = None,
+    passed_num: int | None = None,
 ) -> None:
     path = Path(extra_info_path)
     payload: dict[str, Any]
@@ -270,6 +273,8 @@ def _update_extra_info(
         payload["legal"] = bool(legal)
     if reason is not None:
         payload["reason"] = reason
+    if passed_num is not None:
+        payload["passed_num"] = int(passed_num)
     timeout_env = os.getenv("RUN_TESTS_TIMEOUT")
     if timeout_env:
         try:
@@ -506,6 +511,7 @@ def request_host_validation(
         ]
         if isinstance(data.get("image_history"), list)
         else None,
+        data.get("passed_num") if isinstance(data.get("passed_num"), int) else None,
     )
 
 
