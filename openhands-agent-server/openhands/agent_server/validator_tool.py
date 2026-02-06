@@ -26,6 +26,7 @@ from openhands.sdk.tool import (
 
 _VALIDATOR_CALL_COUNT = 0
 _VALIDATOR_CALL_LOCK = threading.Lock()
+_CLEANUP_REQUEST_TIMEOUT_SECONDS = 60
 
 
 @dataclass
@@ -88,7 +89,6 @@ class ValidatorExecutor(ToolExecutor[ValidatorAction, ValidatorObservation]):
             "host_task_dir": host_task_dir,
         }
         host_gateway_ip = os.getenv("HOST_GATEWAY_IP", "172.17.0.1")
-        timeout_seconds = int(os.getenv("VALIDATOR_TOOL_REQUEST_TIMEOUT", "1800"))
         port = int(os.getenv("VALIDATOR_PORT", "9090"))
         url = f"http://{host_gateway_ip}:{port}/cleanup_images"
 
@@ -99,7 +99,7 @@ class ValidatorExecutor(ToolExecutor[ValidatorAction, ValidatorObservation]):
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urlopen(request, timeout=timeout_seconds):
+            with urlopen(request, timeout=_CLEANUP_REQUEST_TIMEOUT_SECONDS):
                 pass
             with self._tracked_lock:
                 self._tracked_image_names.difference_update(image_names)
@@ -450,7 +450,6 @@ def request_host_validation(
     host_task_dir: str,
     call_count: int | None = None,
     image_name: str,
-    timeout_seconds: int | None = None,
 ) -> ValidationResult:
     try:
         dockerfile_text = Path(dockerfile_path).read_text()
@@ -469,8 +468,6 @@ def request_host_validation(
     }
 
     host_gateway_ip = os.getenv("HOST_GATEWAY_IP", "172.17.0.1")
-    if timeout_seconds is None:
-        timeout_seconds = int(os.getenv("VALIDATOR_TOOL_REQUEST_TIMEOUT", "1800"))
     port = int(os.getenv("VALIDATOR_PORT", "9090"))
     url = f"http://{host_gateway_ip}:{port}/validate"
 
@@ -481,7 +478,7 @@ def request_host_validation(
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urlopen(request, timeout=timeout_seconds) as response:
+        with urlopen(request) as response:
             data = json.loads(response.read().decode("utf-8"))
     except URLError as exc:
         return ValidationResult(False, f"Host validation request failed: {exc}")

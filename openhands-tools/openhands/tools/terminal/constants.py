@@ -23,6 +23,13 @@ TIMEOUT_MESSAGE_TEMPLATE = (
     "or use the timeout parameter in terminal for future commands."
 )
 
+# Additional guidance shown only for hard timeout scenarios.
+HARD_TIMEOUT_DEPENDENCY_HINT = (
+    "If this command is installing dependencies, check installation progress "
+    "and download speed first; if downloads are progressing normally at a "
+    "reasonable speed, keep waiting and monitor speed periodically."
+)
+
 # How long to wait with no new output before considering it a no-change timeout
 NO_CHANGE_TIMEOUT_SECONDS = 30
 

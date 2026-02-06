@@ -8,6 +8,7 @@ from openhands.sdk.logger import get_logger
 from openhands.sdk.utils import maybe_truncate
 from openhands.tools.terminal.constants import (
     CMD_OUTPUT_PS1_END,
+    HARD_TIMEOUT_DEPENDENCY_HINT,
     MAX_CMD_OUTPUT_SIZE,
     NO_CHANGE_TIMEOUT_SECONDS,
     POLL_INTERVAL,
@@ -258,7 +259,8 @@ class TerminalSession(TerminalSessionBase):
         metadata = CmdOutputMetadata()  # No metadata available
         metadata.suffix = (
             f"\n[The command timed out after {timeout} seconds. "
-            f"{TIMEOUT_MESSAGE_TEMPLATE}]"
+            f"{TIMEOUT_MESSAGE_TEMPLATE} "
+            f"{HARD_TIMEOUT_DEPENDENCY_HINT}]"
         )
         command_output = self._get_command_output(
             command,
