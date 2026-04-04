@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -11,6 +12,11 @@ from pathlib import Path
 
 from pydantic import Field
 
+from alpha.shared.record_id_codec import (
+    file_path_to_slug,
+    parse_record_id,
+    repo_to_slug,
+)
 from openhands.sdk import ImageContent, TextContent
 from openhands.sdk.tool import (
     Action,
@@ -19,31 +25,6 @@ from openhands.sdk.tool import (
     ToolExecutor,
     register_tool,
 )
-
-
-def _repo_slug(repo: str) -> str:
-    return repo.replace("/", "_").lower()
-
-
-def _slugify_test_file_path(test_file_path: str) -> str:
-    normalized = test_file_path.strip()
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", normalized)
-    safe = re.sub(r"_+", "_", safe).strip("_")
-    readable = safe or "unknown_test_file"
-    digest8 = sha1(normalized.encode("utf-8")).hexdigest()[:8]
-    return f"{readable}-{digest8}"
-
-
-def _parse_record_id(record_id: str) -> tuple[str, str, int]:
-    match = re.match(r"^([^:]+/[^:]+)::(.+)::depth=(\d+)$", record_id.strip())
-    if not match:
-        raise ValueError(
-            "Invalid record_id format. Expected: {repo}::{test_file_path}::depth={k}"
-        )
-    repo = match.group(1)
-    test_file_path = match.group(2).strip()
-    depth = int(match.group(3))
-    return repo, test_file_path, depth
 
 
 def _resolve_timeout_seconds() -> int:
@@ -60,10 +41,14 @@ def _resolve_timeout_seconds() -> int:
 
 
 def _runtime_paths(repo: str, test_file_slug: str, depth: int) -> tuple[Path, Path]:
-    repo_slug = _repo_slug(repo)
+    repo_slug = repo_to_slug(repo)
     run_tests_path = Path(f"/tmp/{repo_slug}/run_tests.py")
     check_dir = Path(f"/tmp/{repo_slug}/checks/{test_file_slug}/depth_{depth}")
     return run_tests_path, check_dir
+
+
+def _baseline_json_path(repo: str) -> Path:
+    return Path(f"/tmp/{repo_to_slug(repo)}/baseline/baseline.json")
 
 
 def _next_check_index(check_dir: Path) -> int:
@@ -124,18 +109,88 @@ def _parse_result_text_at_least_one_header(text: str) -> tuple[list[str], list[s
     return sorted(set(passed_paths)), sorted(set(failed_paths))
 
 
+def _load_baseline_pass(repo: str) -> list[str]:
+    baseline_path = _baseline_json_path(repo)
+    if not baseline_path.exists():
+        raise ValueError(
+            f"missing baseline file: {baseline_path}. run baseline(depth=0) first"
+        )
+
+    try:
+        payload = json.loads(baseline_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"invalid baseline json: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError("invalid baseline json: root must be an object")
+
+    baseline_pass_raw = payload.get("baseline_pass")
+    if not isinstance(baseline_pass_raw, list):
+        raise ValueError("invalid baseline json: baseline_pass must be a list")
+
+    baseline_pass: list[str] = []
+    for item in baseline_pass_raw:
+        if not isinstance(item, str) or not item.startswith("/testbed/"):
+            raise ValueError(
+                "invalid baseline json: each baseline_pass item must start with /testbed/"
+            )
+        baseline_pass.append(item)
+    return sorted(set(baseline_pass))
+
+
+def _compute_workspace_fingerprint() -> str:
+    proc = subprocess.run(
+        [
+            "bash",
+            "-lc",
+            (
+                "set -euo pipefail; "
+                "git -C /testbed status --porcelain=v1 --untracked-files=all; "
+                "git -C /testbed diff --binary HEAD"
+            ),
+        ],
+        capture_output=True,
+        text=False,
+        check=False,
+    )
+    if proc.returncode != 0:
+        stderr = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            f"fingerprint command failed with returncode={proc.returncode}: {stderr}"
+        )
+    return sha1(proc.stdout or b"").hexdigest()
+
+
+def _write_check_meta(
+    *,
+    meta_path: Path,
+    record_id: str,
+    repo: str,
+    depth: int,
+    round_index: int,
+    result_path: Path,
+    workspace_fingerprint: str,
+    f2p: list[str],
+    p2p: list[str],
+) -> None:
+    payload = {
+        "ok": True,
+        "record_id": record_id,
+        "repo": repo,
+        "depth": depth,
+        "round": round_index,
+        "result_path": str(result_path),
+        "workspace_fingerprint": workspace_fingerprint,
+        "f2p": f2p,
+        "p2p": p2p,
+    }
+    meta_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
 class CheckAction(Action):
     record_id: str = Field(description="Canonical record id")
     repo: str = Field(description="Repository in owner/name format")
     depth: int = Field(ge=1, description="Current depth (baseline is depth=0)")
-    f2p_candidates: list[str] = Field(
-        default_factory=list,
-        description="Candidate files for breakage target tracking",
-    )
-    p2p_candidates: list[str] = Field(
-        default_factory=list,
-        description="Candidate files for protection tracking",
-    )
 
 
 class CheckObservation(Observation):
@@ -145,6 +200,7 @@ class CheckObservation(Observation):
     depth: int
     f2p: list[str] = Field(default_factory=list)
     p2p: list[str] = Field(default_factory=list)
+    workspace_fingerprint: str | None = Field(default=None)
 
     @property
     def to_llm_content(self) -> Sequence[TextContent | ImageContent]:
@@ -157,6 +213,8 @@ class CheckObservation(Observation):
             f"f2p_count: {len(self.f2p)}",
             f"p2p_count: {len(self.p2p)}",
         ]
+        if self.workspace_fingerprint:
+            summary.append(f"workspace_fingerprint: {self.workspace_fingerprint}")
         return [TextContent(text="\n".join(summary))]
 
 
@@ -168,20 +226,16 @@ class CheckExecutor(ToolExecutor[CheckAction, CheckObservation]):
                 message="depth must be >= 1",
                 record_id=action.record_id,
                 depth=action.depth,
-                f2p=[],
-                p2p=[],
             )
 
         try:
-            parsed_repo, test_file_path, parsed_depth = _parse_record_id(action.record_id)
+            parsed_repo, test_file_path, parsed_depth = parse_record_id(action.record_id)
         except ValueError as exc:
             return CheckObservation(
                 ok=False,
                 message=f"invalid record_id: {exc}",
                 record_id=action.record_id,
                 depth=action.depth,
-                f2p=[],
-                p2p=[],
             )
 
         if parsed_repo != action.repo:
@@ -190,8 +244,6 @@ class CheckExecutor(ToolExecutor[CheckAction, CheckObservation]):
                 message="record_id repo does not match action.repo",
                 record_id=action.record_id,
                 depth=action.depth,
-                f2p=[],
-                p2p=[],
             )
 
         if parsed_depth != action.depth:
@@ -200,11 +252,30 @@ class CheckExecutor(ToolExecutor[CheckAction, CheckObservation]):
                 message="record_id depth does not match action.depth",
                 record_id=action.record_id,
                 depth=action.depth,
-                f2p=[],
-                p2p=[],
             )
 
-        test_file_slug = _slugify_test_file_path(test_file_path)
+        try:
+            baseline_pass = _load_baseline_pass(action.repo)
+        except ValueError as exc:
+            return CheckObservation(
+                ok=False,
+                message=f"invalid baseline state: {exc}",
+                record_id=action.record_id,
+                depth=action.depth,
+            )
+
+        if test_file_path not in set(baseline_pass):
+            return CheckObservation(
+                ok=False,
+                message=(
+                    "target test_file_path is not in baseline_pass; "
+                    "current record_id is invalid for depth loop"
+                ),
+                record_id=action.record_id,
+                depth=action.depth,
+            )
+
+        test_file_slug = file_path_to_slug(test_file_path)
         run_tests_path, check_dir = _runtime_paths(action.repo, test_file_slug, action.depth)
         if not run_tests_path.exists():
             return CheckObservation(
@@ -215,13 +286,12 @@ class CheckExecutor(ToolExecutor[CheckAction, CheckObservation]):
                 ),
                 record_id=action.record_id,
                 depth=action.depth,
-                f2p=[],
-                p2p=[],
             )
 
         check_dir.mkdir(parents=True, exist_ok=True)
         round_index = _next_check_index(check_dir)
         result_path = check_dir / f"check_{round_index}.txt"
+        meta_path = check_dir / f"check_{round_index}.meta.json"
 
         cmd = [
             "python3",
@@ -239,8 +309,6 @@ class CheckExecutor(ToolExecutor[CheckAction, CheckObservation]):
                 message=f"invalid timeout config: {exc}",
                 record_id=action.record_id,
                 depth=action.depth,
-                f2p=[],
-                p2p=[],
             )
 
         try:
@@ -257,8 +325,6 @@ class CheckExecutor(ToolExecutor[CheckAction, CheckObservation]):
                 message=f"check timeout after {timeout_seconds}s",
                 record_id=action.record_id,
                 depth=action.depth,
-                f2p=[],
-                p2p=[],
             )
 
         if proc.returncode != 0:
@@ -272,8 +338,6 @@ class CheckExecutor(ToolExecutor[CheckAction, CheckObservation]):
                 ),
                 record_id=action.record_id,
                 depth=action.depth,
-                f2p=[],
-                p2p=[],
             )
 
         if not result_path.exists():
@@ -282,8 +346,6 @@ class CheckExecutor(ToolExecutor[CheckAction, CheckObservation]):
                 message=f"result file missing: {result_path}",
                 record_id=action.record_id,
                 depth=action.depth,
-                f2p=[],
-                p2p=[],
             )
 
         try:
@@ -296,22 +358,53 @@ class CheckExecutor(ToolExecutor[CheckAction, CheckObservation]):
                 message=f"invalid result format: {exc}",
                 record_id=action.record_id,
                 depth=action.depth,
-                f2p=[],
-                p2p=[],
             )
 
-        f2p = sorted(set(failed_paths) & set(action.f2p_candidates))
-        p2p = sorted(set(passed_paths) & set(action.p2p_candidates))
+        baseline_set = set(baseline_pass)
+        f2p = sorted(baseline_set & set(failed_paths))
+        p2p = sorted(baseline_set & set(passed_paths))
+
+        try:
+            workspace_fingerprint = _compute_workspace_fingerprint()
+        except RuntimeError as exc:
+            return CheckObservation(
+                ok=False,
+                message=f"failed to compute workspace fingerprint: {exc}",
+                record_id=action.record_id,
+                depth=action.depth,
+            )
+
+        try:
+            _write_check_meta(
+                meta_path=meta_path,
+                record_id=action.record_id,
+                repo=action.repo,
+                depth=action.depth,
+                round_index=round_index,
+                result_path=result_path,
+                workspace_fingerprint=workspace_fingerprint,
+                f2p=f2p,
+                p2p=p2p,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return CheckObservation(
+                ok=False,
+                message=f"failed to write check metadata: {exc}",
+                record_id=action.record_id,
+                depth=action.depth,
+            )
+
         return CheckObservation(
             ok=True,
             message=(
                 f"check ok: depth={action.depth}, round={round_index}, "
-                f"result={result_path}"
+                f"result={result_path}, meta={meta_path}"
             ),
             record_id=action.record_id,
             depth=action.depth,
             f2p=f2p,
             p2p=p2p,
+            workspace_fingerprint=workspace_fingerprint,
         )
 
 
@@ -327,12 +420,13 @@ class CheckTool(ToolDefinition[CheckAction, CheckObservation]):
                     "been prepared for this repo and your latest code edits are ready "
                     "for validation. "
                     "This tool executes run_tests.py and computes f2p/p2p against "
-                    "candidates, which may be slow depending on test cost. "
+                    "baseline_pass (commit0 baseline), which may be slow depending "
+                    "on test cost. "
                     "DO NOT call it repeatedly without meaningful code changes. "
-                    "You MUST provide record_id, repo, depth, f2p_candidates, and "
-                    "p2p_candidates. It reads timeout from RUN_TESTS_TIMEOUT and "
-                    "writes per-round results under "
-                    "/tmp/<repo_slug>/checks/<test_file_slug>/depth_<k>/check_<n>.txt."
+                    "You MUST provide record_id, repo, and depth. Test execution timeout "
+                    "is read from RUN_TESTS_TIMEOUT, and the tool writes per-round artifacts under "
+                    "/tmp/<repo_slug>/checks/<test_file_slug>/depth_<k>/check_<n>.txt "
+                    "and check_<n>.meta.json."
                 ),
                 action_type=CheckAction,
                 observation_type=CheckObservation,
