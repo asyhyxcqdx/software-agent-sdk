@@ -1,4 +1,4 @@
-"""Save tool precheck scaffold for task-maker depth snapshots."""
+"""Save tool precheck scaffold for task-maker target/depth snapshots."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from alpha.shared.record_id_codec import format_record_id
 from openhands.sdk import ImageContent, TextContent
 from openhands.sdk.tool import (
     Action,
@@ -18,20 +19,15 @@ from openhands.sdk.tool import (
     ToolExecutor,
     register_tool,
 )
-from alpha.shared.record_id_codec import (
-    file_path_to_slug,
-    parse_record_id,
-    record_id_to_slug,
-    repo_to_slug,
-)
+from alpha.shared.target_id_codec import parse_target_id, target_id_to_slug
 
 
-def _baseline_json_path(repo: str) -> Path:
-    return Path(f"/tmp/{repo_to_slug(repo)}/baseline/baseline.json")
+def _baseline_json_path() -> Path:
+    return Path("/output/baseline/baseline.json")
 
 
-def _load_baseline_json(repo: str) -> dict:
-    baseline_path = _baseline_json_path(repo)
+def _load_baseline_json() -> dict:
+    baseline_path = _baseline_json_path()
     if not baseline_path.exists():
         raise ValueError(
             f"missing baseline file: {baseline_path}. run baseline(depth=0) first"
@@ -61,9 +57,57 @@ def _load_baseline_json(repo: str) -> dict:
     return payload
 
 
-def _check_dir(repo: str, test_file_slug: str, depth: int) -> Path:
-    repo_slug = repo_to_slug(repo)
-    return Path(f"/tmp/{repo_slug}/checks/{test_file_slug}/depth_{depth}")
+def _check_dir(target_id: str, depth: int) -> Path:
+    target_id_slug = target_id_to_slug(target_id)
+    return Path(f"/output/records/{target_id_slug}/check/depth_{depth}")
+
+
+def _save_root(target_id: str) -> Path:
+    target_id_slug = target_id_to_slug(target_id)
+    return Path(f"/output/records/{target_id_slug}/save")
+
+
+def _depth_state_path(target_id: str) -> Path:
+    target_id_slug = target_id_to_slug(target_id)
+    return Path(f"/runtime/targets/{target_id_slug}/state.json")
+
+
+def _candidate_depth(target_id: str) -> int:
+    state_path = _depth_state_path(target_id)
+    if not state_path.exists():
+        raise ValueError(
+            f"missing depth state: {state_path}. target conversation must initialize current_depth first"
+        )
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"invalid depth state json: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("invalid depth state json: root must be an object")
+    payload_target_id = payload.get("target_id")
+    if payload_target_id != target_id:
+        raise ValueError("invalid depth state json: target_id mismatch")
+    current_depth = payload.get("current_depth")
+    if not isinstance(current_depth, int) or current_depth < 1:
+        raise ValueError("invalid depth state json: current_depth must be int >= 1")
+    return current_depth
+
+
+def _advance_depth_state(target_id: str, next_depth: int) -> None:
+    if next_depth < 1:
+        raise ValueError("next_depth must be >= 1")
+    state_path = _depth_state_path(target_id)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "target_id": target_id,
+                "current_depth": next_depth,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
 
 def _load_check_meta(meta_path: Path) -> dict:
@@ -76,21 +120,27 @@ def _load_check_meta(meta_path: Path) -> dict:
     return payload
 
 
-def _find_latest_success_meta(
-    *, check_dir: Path, record_id: str, repo: str, depth: int
-) -> dict | None:
+def _find_latest_success_meta(*, check_dir: Path, target_id: str, depth: int) -> dict | None:
     if not check_dir.exists():
         return None
 
+    expected_record_id = format_record_id(target_id, depth)
     candidates: list[dict] = []
-    for meta_path in check_dir.glob("check_*.meta.json"):
+    meta_paths = sorted(check_dir.glob("turn_*/meta.json"))
+    if not meta_paths:
+        meta_paths = sorted(check_dir.glob("check_*.meta.json"))
+    for meta_path in meta_paths:
         payload = _load_check_meta(meta_path)
         if payload.get("ok") is not True:
             continue
-        if payload.get("record_id") != record_id:
+        payload_target_id = payload.get("target_id", payload.get("record_id"))
+        if payload_target_id != target_id:
             continue
-        if payload.get("repo") != repo:
-            continue
+        payload_record_id = payload.get("record_id")
+        if payload_record_id is not None and payload_record_id != expected_record_id:
+            raise ValueError(
+                f"invalid check meta {meta_path}: record_id must equal current target_id+depth"
+            )
         if payload.get("depth") != depth:
             continue
         round_raw = payload.get("round")
@@ -189,13 +239,13 @@ def _git_identity_effective() -> tuple[bool, str]:
     return True, ""
 
 
-def _save_output_path(record_id: str, depth: int) -> Path:
-    record_id_slug = record_id_to_slug(record_id)
-    return Path(f"/output/{record_id_slug}/depth_{depth}/save.json")
+def _save_output_path(target_id: str, depth: int) -> Path:
+    target_id_slug = target_id_to_slug(target_id)
+    return Path(f"/output/records/{target_id_slug}/save/depth_{depth}/save.json")
 
 
 def _write_save_output(task_record: "SaveTaskRecord") -> Path:
-    output_path = _save_output_path(task_record.record_id, task_record.depth)
+    output_path = _save_output_path(task_record.target_id, task_record.depth)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = task_record.model_dump()
     output_path.write_text(
@@ -206,12 +256,11 @@ def _write_save_output(task_record: "SaveTaskRecord") -> Path:
 
 
 class SaveAction(Action):
-    record_id: str = Field(description="Canonical record id")
-    repo: str = Field(description="Repository in owner/name format")
-    depth: int = Field(ge=1, description="Current depth (baseline is depth=0)")
+    target_id: str = Field(description="Stable target id: {repo}::{test_file_path}")
 
 
 class SaveTaskRecord(BaseModel):
+    target_id: str
     record_id: str
     repo: str
     commit: str
@@ -236,6 +285,7 @@ class SaveObservation(Observation):
             f"Message: {self.message}",
         ]
         if self.task_record is not None:
+            summary.append(f"target_id: {self.task_record.target_id}")
             summary.append(f"record_id: {self.task_record.record_id}")
             summary.append(f"depth: {self.task_record.depth}")
             summary.append(f"commit: {self.task_record.commit}")
@@ -283,22 +333,15 @@ class SaveExecutor(ToolExecutor[SaveAction, SaveObservation]):
 
     def _run_precheck(
         self, action: SaveAction
-    ) -> tuple[str, dict] | SaveObservation:
-        if action.depth < 1:
-            return self._save_failed("depth must be >= 1")
-
+    ) -> tuple[str, dict, int] | SaveObservation:
         try:
-            parsed_repo, test_file_path, parsed_depth = parse_record_id(action.record_id)
+            parsed_repo, test_file_path = parse_target_id(action.target_id)
         except ValueError as exc:
-            return self._save_failed(f"invalid record_id: {exc}")
-
-        if parsed_repo != action.repo:
-            return self._save_failed("record_id repo does not match action.repo")
-        if parsed_depth != action.depth:
-            return self._save_failed("record_id depth does not match action.depth")
+            return self._save_failed(f"invalid target_id: {exc}")
+        repo = parsed_repo
 
         try:
-            baseline = _load_baseline_json(action.repo)
+            baseline = _load_baseline_json()
         except ValueError as exc:
             return self._save_failed(f"invalid baseline state: {exc}")
 
@@ -309,14 +352,16 @@ class SaveExecutor(ToolExecutor[SaveAction, SaveObservation]):
         if test_file_path not in baseline_pass:
             return self._save_failed("target test_file_path is not in baseline_pass")
 
-        test_file_slug = file_path_to_slug(test_file_path)
-        check_dir = _check_dir(action.repo, test_file_slug, action.depth)
+        try:
+            current_depth = _candidate_depth(action.target_id)
+        except ValueError as exc:
+            return self._save_failed(f"invalid depth state: {exc}")
+        check_dir = _check_dir(action.target_id, current_depth)
         try:
             meta = _find_latest_success_meta(
                 check_dir=check_dir,
-                record_id=action.record_id,
-                repo=action.repo,
-                depth=action.depth,
+                target_id=action.target_id,
+                depth=current_depth,
             )
         except ValueError as exc:
             return self._save_failed(f"invalid check meta state: {exc}")
@@ -351,13 +396,15 @@ class SaveExecutor(ToolExecutor[SaveAction, SaveObservation]):
         if not identity_ok:
             return self._save_failed(f"git identity missing: {identity_msg}")
 
-        return commit0, meta
+        meta["repo"] = repo
+        return commit0, meta, current_depth
 
     def __call__(self, action: SaveAction, conversation=None) -> SaveObservation:  # noqa: ARG002
         precheck = self._run_precheck(action)
         if isinstance(precheck, SaveObservation):
             return precheck
-        commit0, meta = precheck
+        commit0, meta, current_depth = precheck
+        current_record_id = format_record_id(action.target_id, current_depth)
 
         try:
             add_proc = _git_run(["-C", "/testbed", "add", "-A"])
@@ -375,7 +422,7 @@ class SaveExecutor(ToolExecutor[SaveAction, SaveObservation]):
                     "/testbed",
                     "commit",
                     "-m",
-                    f"task_maker save depth={action.depth}",
+                    f"task_maker save depth={current_depth}",
                 ]
             )
         except RuntimeError as exc:
@@ -413,14 +460,15 @@ class SaveExecutor(ToolExecutor[SaveAction, SaveObservation]):
             return self._post_commit_failure(commit_k, "gold_patch is empty")
 
         task_record = SaveTaskRecord(
-            record_id=action.record_id,
-            repo=action.repo,
+            target_id=action.target_id,
+            record_id=current_record_id,
+            repo=meta["repo"],
             commit=commit_k,
             f2p=meta["f2p"],
             p2p=meta["p2p"],
             gold_patch=gold_patch,
             issue="TODO(issue): placeholder",
-            depth=action.depth,
+            depth=current_depth,
             hint="TODO(hint): placeholder",
         )
         try:
@@ -429,6 +477,13 @@ class SaveExecutor(ToolExecutor[SaveAction, SaveObservation]):
             return self._post_commit_failure(
                 commit_k,
                 f"failed to write save output: {exc}",
+            )
+        try:
+            _advance_depth_state(action.target_id, current_depth + 1)
+        except Exception as exc:  # noqa: BLE001
+            return self._post_commit_failure(
+                commit_k,
+                f"failed to advance depth state: {exc}",
             )
         return SaveObservation(ok=True, message="save ok", task_record=task_record)
 
@@ -442,11 +497,15 @@ class SaveTool(ToolDefinition[SaveAction, SaveObservation]):
             cls(
                 description=(
                     "Save current depth snapshot for task-maker. "
-                    "Input requires record_id/repo/depth. "
+                    "Input requires target_id only. "
+                    "Current candidate depth is read from the per-target conversation state. "
+                    "Host initializes it to 1 for each target flow, and save_tool advances it after each successful save. "
+                    "A successful save materializes one concrete sample identity "
+                    "record_id = {target_id}::depth=<current_depth>. "
                     "This version runs prechecks, commits workspace changes, and "
                     "produces gold_patch from diff(commit0, commit_k). It uses "
                     "post_commit_failure semantics if failures happen after commit. "
-                    "Successful saves write /output/<record_id_slug>/depth_<k>/save.json. "
+                    "Successful saves write /output/records/<target_id_slug>/save/depth_<k>/save.json. "
                     "Task DB persistence is performed by host-side task_maker ingest "
                     "(not inside save_tool). issue/hint are currently placeholder values."
                 ),

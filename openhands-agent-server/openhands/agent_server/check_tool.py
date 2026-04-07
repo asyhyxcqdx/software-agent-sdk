@@ -1,4 +1,4 @@
-"""Check tool for task-maker depth validation."""
+"""Check tool for task-maker target/depth validation."""
 
 from __future__ import annotations
 
@@ -12,10 +12,12 @@ from pathlib import Path
 
 from pydantic import Field
 
-from alpha.shared.record_id_codec import (
-    file_path_to_slug,
-    parse_record_id,
+from alpha.shared.record_id_codec import format_record_id
+from alpha.shared.target_test_details_schema import load_target_details_file
+from alpha.shared.target_id_codec import (
+    parse_target_id,
     repo_to_slug,
+    target_id_to_slug,
 )
 from openhands.sdk import ImageContent, TextContent
 from openhands.sdk.tool import (
@@ -40,21 +42,60 @@ def _resolve_timeout_seconds() -> int:
     return value
 
 
-def _runtime_paths(repo: str, test_file_slug: str, depth: int) -> tuple[Path, Path]:
+def _runtime_paths(target_id: str, depth: int) -> tuple[Path, Path]:
+    repo, _ = parse_target_id(target_id)
     repo_slug = repo_to_slug(repo)
-    run_tests_path = Path(f"/tmp/{repo_slug}/run_tests.py")
-    check_dir = Path(f"/tmp/{repo_slug}/checks/{test_file_slug}/depth_{depth}")
-    return run_tests_path, check_dir
+    target_id_slug = target_id_to_slug(target_id)
+    run_tests_path = Path(f"/runtime/{repo_slug}/run_tests.py")
+    check_depth_dir = Path(f"/output/records/{target_id_slug}/check/depth_{depth}")
+    return run_tests_path, check_depth_dir
 
 
-def _baseline_json_path(repo: str) -> Path:
-    return Path(f"/tmp/{repo_to_slug(repo)}/baseline/baseline.json")
+def _details_path(turn_dir: Path) -> Path:
+    return turn_dir / "details.json"
 
 
-def _next_check_index(check_dir: Path) -> int:
+def _save_root(target_id: str) -> Path:
+    target_id_slug = target_id_to_slug(target_id)
+    return Path(f"/output/records/{target_id_slug}/save")
+
+
+def _depth_state_path(target_id: str) -> Path:
+    target_id_slug = target_id_to_slug(target_id)
+    return Path(f"/runtime/targets/{target_id_slug}/state.json")
+
+
+def _candidate_depth(target_id: str) -> int:
+    state_path = _depth_state_path(target_id)
+    if not state_path.exists():
+        raise ValueError(
+            f"missing depth state: {state_path}. target conversation must initialize current_depth first"
+        )
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"invalid depth state json: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("invalid depth state json: root must be an object")
+    payload_target_id = payload.get("target_id")
+    if payload_target_id != target_id:
+        raise ValueError("invalid depth state json: target_id mismatch")
+    current_depth = payload.get("current_depth")
+    if not isinstance(current_depth, int) or current_depth < 1:
+        raise ValueError("invalid depth state json: current_depth must be int >= 1")
+    return current_depth
+
+
+def _baseline_json_path() -> Path:
+    return Path("/output/baseline/baseline.json")
+
+
+def _next_check_index(check_depth_dir: Path) -> int:
     max_index = 0
-    for path in check_dir.glob("check_*.txt"):
-        match = re.match(r"^check_(\d+)\.txt$", path.name)
+    for path in check_depth_dir.glob("turn_*"):
+        if not path.is_dir():
+            continue
+        match = re.match(r"^turn_(\d+)$", path.name)
         if not match:
             continue
         max_index = max(max_index, int(match.group(1)))
@@ -108,9 +149,19 @@ def _parse_result_text_at_least_one_header(text: str) -> tuple[list[str], list[s
         )
     return sorted(set(passed_paths)), sorted(set(failed_paths))
 
+def _load_target_details(
+    details_path: Path,
+    *,
+    expected_target_test_file_path: str,
+) -> dict[str, object] | None:
+    return load_target_details_file(
+        details_path,
+        expected_target_test_file_path=expected_target_test_file_path,
+    )
 
-def _load_baseline_pass(repo: str) -> list[str]:
-    baseline_path = _baseline_json_path(repo)
+
+def _load_baseline_pass() -> list[str]:
+    baseline_path = _baseline_json_path()
     if not baseline_path.exists():
         raise ValueError(
             f"missing baseline file: {baseline_path}. run baseline(depth=0) first"
@@ -164,6 +215,7 @@ def _compute_workspace_fingerprint() -> str:
 def _write_check_meta(
     *,
     meta_path: Path,
+    target_id: str,
     record_id: str,
     repo: str,
     depth: int,
@@ -172,9 +224,20 @@ def _write_check_meta(
     workspace_fingerprint: str,
     f2p: list[str],
     p2p: list[str],
+    target_test_file_path: str,
+    target_file_failed: bool,
+    other_failed_test_files: list[str],
+    details_path: Path | None = None,
+    target_total_test_cases: int | None = None,
+    target_passed_test_cases: int | None = None,
+    target_failed_test_cases: int | None = None,
+    target_test_case_pass_rate: float | None = None,
+    target_passed_test_case_ids: list[str] | None = None,
+    target_failed_test_case_ids: list[str] | None = None,
 ) -> None:
     payload = {
         "ok": True,
+        "target_id": target_id,
         "record_id": record_id,
         "repo": repo,
         "depth": depth,
@@ -183,23 +246,50 @@ def _write_check_meta(
         "workspace_fingerprint": workspace_fingerprint,
         "f2p": f2p,
         "p2p": p2p,
+        "target_test_file_path": target_test_file_path,
+        "target_file_failed": target_file_failed,
+        "other_failed_test_files": other_failed_test_files,
+        "other_failed_test_file_count": len(other_failed_test_files),
     }
+    if details_path is not None:
+        payload["details_path"] = str(details_path)
+    if target_total_test_cases is not None:
+        payload["target_total_test_cases"] = target_total_test_cases
+    if target_passed_test_cases is not None:
+        payload["target_passed_test_cases"] = target_passed_test_cases
+    if target_failed_test_cases is not None:
+        payload["target_failed_test_cases"] = target_failed_test_cases
+    if target_test_case_pass_rate is not None:
+        payload["target_test_case_pass_rate"] = target_test_case_pass_rate
+    if target_passed_test_case_ids is not None:
+        payload["target_passed_test_case_ids"] = target_passed_test_case_ids
+    if target_failed_test_case_ids is not None:
+        payload["target_failed_test_case_ids"] = target_failed_test_case_ids
     meta_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 class CheckAction(Action):
-    record_id: str = Field(description="Canonical record id")
-    repo: str = Field(description="Repository in owner/name format")
-    depth: int = Field(ge=1, description="Current depth (baseline is depth=0)")
+    target_id: str = Field(description="Stable target id: {repo}::{test_file_path}")
 
 
 class CheckObservation(Observation):
     ok: bool
     message: str
-    record_id: str
+    target_id: str
+    record_id: str | None = Field(default=None)
     depth: int
     f2p: list[str] = Field(default_factory=list)
     p2p: list[str] = Field(default_factory=list)
+    target_test_file_path: str | None = Field(default=None)
+    target_file_failed: bool = Field(default=False)
+    other_failed_test_files: list[str] = Field(default_factory=list)
+    other_failed_test_file_count: int = Field(default=0)
+    target_total_test_cases: int | None = Field(default=None)
+    target_passed_test_cases: int | None = Field(default=None)
+    target_failed_test_cases: int | None = Field(default=None)
+    target_test_case_pass_rate: float | None = Field(default=None)
+    target_passed_test_case_ids: list[str] = Field(default_factory=list)
+    target_failed_test_case_ids: list[str] = Field(default_factory=list)
     workspace_fingerprint: str | None = Field(default=None)
 
     @property
@@ -208,11 +298,45 @@ class CheckObservation(Observation):
         summary = [
             f"Check status: {status}",
             f"Message: {self.message}",
-            f"record_id: {self.record_id}",
+            f"target_id: {self.target_id}",
+        ]
+        if self.record_id:
+            summary.append(f"record_id: {self.record_id}")
+        summary.extend(
+            [
             f"depth: {self.depth}",
             f"f2p_count: {len(self.f2p)}",
             f"p2p_count: {len(self.p2p)}",
-        ]
+            f"target_file_failed: {self.target_file_failed}",
+            f"other_failed_test_file_count: {self.other_failed_test_file_count}",
+            ]
+        )
+        if self.target_test_file_path:
+            summary.append(f"target_test_file_path: {self.target_test_file_path}")
+        if self.target_total_test_cases is not None:
+            summary.extend(
+                [
+                    f"target_total_test_cases: {self.target_total_test_cases}",
+                    f"target_passed_test_cases: {self.target_passed_test_cases}",
+                    f"target_failed_test_cases: {self.target_failed_test_cases}",
+                    f"target_test_case_pass_rate: {self.target_test_case_pass_rate}",
+                ]
+            )
+        if self.target_passed_test_case_ids:
+            summary.append(
+                "target_passed_test_case_ids:\n"
+                + "\n".join(self.target_passed_test_case_ids)
+            )
+        if self.target_failed_test_case_ids:
+            summary.append(
+                "target_failed_test_case_ids:\n"
+                + "\n".join(self.target_failed_test_case_ids)
+            )
+        if self.other_failed_test_files:
+            summary.append(
+                "other_failed_test_files:\n"
+                + "\n".join(self.other_failed_test_files)
+            )
         if self.workspace_fingerprint:
             summary.append(f"workspace_fingerprint: {self.workspace_fingerprint}")
         return [TextContent(text="\n".join(summary))]
@@ -220,48 +344,25 @@ class CheckObservation(Observation):
 
 class CheckExecutor(ToolExecutor[CheckAction, CheckObservation]):
     def __call__(self, action: CheckAction, conversation=None) -> CheckObservation:  # noqa: ARG002
-        if action.depth < 1:
-            return CheckObservation(
-                ok=False,
-                message="depth must be >= 1",
-                record_id=action.record_id,
-                depth=action.depth,
-            )
-
         try:
-            parsed_repo, test_file_path, parsed_depth = parse_record_id(action.record_id)
+            parsed_repo, test_file_path = parse_target_id(action.target_id)
         except ValueError as exc:
             return CheckObservation(
                 ok=False,
-                message=f"invalid record_id: {exc}",
-                record_id=action.record_id,
-                depth=action.depth,
+                message=f"invalid target_id: {exc}",
+                target_id=action.target_id,
+                depth=0,
             )
-
-        if parsed_repo != action.repo:
-            return CheckObservation(
-                ok=False,
-                message="record_id repo does not match action.repo",
-                record_id=action.record_id,
-                depth=action.depth,
-            )
-
-        if parsed_depth != action.depth:
-            return CheckObservation(
-                ok=False,
-                message="record_id depth does not match action.depth",
-                record_id=action.record_id,
-                depth=action.depth,
-            )
+        repo = parsed_repo
 
         try:
-            baseline_pass = _load_baseline_pass(action.repo)
+            baseline_pass = _load_baseline_pass()
         except ValueError as exc:
             return CheckObservation(
                 ok=False,
                 message=f"invalid baseline state: {exc}",
-                record_id=action.record_id,
-                depth=action.depth,
+                target_id=action.target_id,
+                depth=0,
             )
 
         if test_file_path not in set(baseline_pass):
@@ -269,14 +370,23 @@ class CheckExecutor(ToolExecutor[CheckAction, CheckObservation]):
                 ok=False,
                 message=(
                     "target test_file_path is not in baseline_pass; "
-                    "current record_id is invalid for depth loop"
+                    "current target_id is invalid for depth loop"
                 ),
-                record_id=action.record_id,
-                depth=action.depth,
+                target_id=action.target_id,
+                depth=0,
             )
 
-        test_file_slug = file_path_to_slug(test_file_path)
-        run_tests_path, check_dir = _runtime_paths(action.repo, test_file_slug, action.depth)
+        try:
+            current_depth = _candidate_depth(action.target_id)
+        except ValueError as exc:
+            return CheckObservation(
+                ok=False,
+                message=f"invalid depth state: {exc}",
+                target_id=action.target_id,
+                depth=0,
+            )
+        current_record_id = format_record_id(action.target_id, current_depth)
+        run_tests_path, check_depth_dir = _runtime_paths(action.target_id, current_depth)
         if not run_tests_path.exists():
             return CheckObservation(
                 ok=False,
@@ -284,22 +394,30 @@ class CheckExecutor(ToolExecutor[CheckAction, CheckObservation]):
                     f"Missing run_tests.py at {run_tests_path}. "
                     "Ensure baseline(depth=0) has been prepared for this repo."
                 ),
-                record_id=action.record_id,
-                depth=action.depth,
+                target_id=action.target_id,
+                record_id=current_record_id,
+                depth=current_depth,
             )
 
-        check_dir.mkdir(parents=True, exist_ok=True)
-        round_index = _next_check_index(check_dir)
-        result_path = check_dir / f"check_{round_index}.txt"
-        meta_path = check_dir / f"check_{round_index}.meta.json"
+        check_depth_dir.mkdir(parents=True, exist_ok=True)
+        round_index = _next_check_index(check_depth_dir)
+        turn_dir = check_depth_dir / f"turn_{round_index}"
+        turn_dir.mkdir(parents=True, exist_ok=True)
+        result_path = turn_dir / "result.txt"
+        details_path = _details_path(turn_dir)
+        meta_path = turn_dir / "meta.json"
 
-        cmd = [
+        cmd_with_details = [
             "python3",
             str(run_tests_path),
             "--input",
             "/testbed",
             "--output",
             str(result_path),
+            "--details-output",
+            str(details_path),
+            "--details-target-file",
+            test_file_path,
         ]
         try:
             timeout_seconds = _resolve_timeout_seconds()
@@ -307,13 +425,14 @@ class CheckExecutor(ToolExecutor[CheckAction, CheckObservation]):
             return CheckObservation(
                 ok=False,
                 message=f"invalid timeout config: {exc}",
-                record_id=action.record_id,
-                depth=action.depth,
+                target_id=action.target_id,
+                record_id=current_record_id,
+                depth=current_depth,
             )
 
         try:
             proc = subprocess.run(
-                cmd,
+                cmd_with_details,
                 capture_output=True,
                 text=True,
                 timeout=timeout_seconds,
@@ -323,29 +442,31 @@ class CheckExecutor(ToolExecutor[CheckAction, CheckObservation]):
             return CheckObservation(
                 ok=False,
                 message=f"check timeout after {timeout_seconds}s",
-                record_id=action.record_id,
-                depth=action.depth,
+                target_id=action.target_id,
+                record_id=current_record_id,
+                depth=current_depth,
             )
 
         if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout or "").strip()
-            detail_excerpt = detail[:1200]
+            detail_excerpt = ((proc.stderr or proc.stdout or "").strip())[:1200]
             return CheckObservation(
                 ok=False,
                 message=(
                     f"run_tests.py failed with returncode={proc.returncode}. "
                     f"detail={detail_excerpt}"
                 ),
-                record_id=action.record_id,
-                depth=action.depth,
+                target_id=action.target_id,
+                record_id=current_record_id,
+                depth=current_depth,
             )
 
         if not result_path.exists():
             return CheckObservation(
                 ok=False,
                 message=f"result file missing: {result_path}",
-                record_id=action.record_id,
-                depth=action.depth,
+                target_id=action.target_id,
+                record_id=current_record_id,
+                depth=current_depth,
             )
 
         try:
@@ -356,13 +477,33 @@ class CheckExecutor(ToolExecutor[CheckAction, CheckObservation]):
             return CheckObservation(
                 ok=False,
                 message=f"invalid result format: {exc}",
-                record_id=action.record_id,
-                depth=action.depth,
+                target_id=action.target_id,
+                record_id=current_record_id,
+                depth=current_depth,
             )
 
         baseline_set = set(baseline_pass)
         f2p = sorted(baseline_set & set(failed_paths))
         p2p = sorted(baseline_set & set(passed_paths))
+        target_file_failed = test_file_path in f2p
+        other_failed_test_files = sorted(
+            path for path in f2p if path != test_file_path
+        )
+
+        target_details: dict[str, object] | None = None
+        try:
+            target_details = _load_target_details(
+                details_path,
+                expected_target_test_file_path=test_file_path,
+            )
+        except ValueError as exc:
+            return CheckObservation(
+                ok=False,
+                message=f"invalid details format: {exc}",
+                target_id=action.target_id,
+                record_id=current_record_id,
+                depth=current_depth,
+            )
 
         try:
             workspace_fingerprint = _compute_workspace_fingerprint()
@@ -370,40 +511,112 @@ class CheckExecutor(ToolExecutor[CheckAction, CheckObservation]):
             return CheckObservation(
                 ok=False,
                 message=f"failed to compute workspace fingerprint: {exc}",
-                record_id=action.record_id,
-                depth=action.depth,
+                target_id=action.target_id,
+                record_id=current_record_id,
+                depth=current_depth,
             )
 
         try:
             _write_check_meta(
                 meta_path=meta_path,
-                record_id=action.record_id,
-                repo=action.repo,
-                depth=action.depth,
+                target_id=action.target_id,
+                record_id=current_record_id,
+                repo=repo,
+                depth=current_depth,
                 round_index=round_index,
                 result_path=result_path,
                 workspace_fingerprint=workspace_fingerprint,
                 f2p=f2p,
                 p2p=p2p,
+                target_test_file_path=test_file_path,
+                target_file_failed=target_file_failed,
+                other_failed_test_files=other_failed_test_files,
+                details_path=details_path if target_details is not None else None,
+                target_total_test_cases=(
+                    target_details.get("target_total_test_cases")
+                    if target_details is not None
+                    else None
+                ),
+                target_passed_test_cases=(
+                    target_details.get("target_passed_test_cases")
+                    if target_details is not None
+                    else None
+                ),
+                target_failed_test_cases=(
+                    target_details.get("target_failed_test_cases")
+                    if target_details is not None
+                    else None
+                ),
+                target_test_case_pass_rate=(
+                    target_details.get("target_test_case_pass_rate")
+                    if target_details is not None
+                    else None
+                ),
+                target_passed_test_case_ids=(
+                    target_details.get("target_passed_test_case_ids")
+                    if target_details is not None
+                    else None
+                ),
+                target_failed_test_case_ids=(
+                    target_details.get("target_failed_test_case_ids")
+                    if target_details is not None
+                    else None
+                ),
             )
         except Exception as exc:  # noqa: BLE001
             return CheckObservation(
                 ok=False,
                 message=f"failed to write check metadata: {exc}",
-                record_id=action.record_id,
-                depth=action.depth,
+                target_id=action.target_id,
+                record_id=current_record_id,
+                depth=current_depth,
             )
 
         return CheckObservation(
             ok=True,
             message=(
-                f"check ok: depth={action.depth}, round={round_index}, "
+                f"check ok: depth={current_depth}, round={round_index}, "
                 f"result={result_path}, meta={meta_path}"
             ),
-            record_id=action.record_id,
-            depth=action.depth,
+            target_id=action.target_id,
+            record_id=current_record_id,
+            depth=current_depth,
             f2p=f2p,
             p2p=p2p,
+            target_test_file_path=test_file_path,
+            target_file_failed=target_file_failed,
+            other_failed_test_files=other_failed_test_files,
+            other_failed_test_file_count=len(other_failed_test_files),
+            target_total_test_cases=(
+                int(target_details["target_total_test_cases"])
+                if target_details is not None
+                else None
+            ),
+            target_passed_test_cases=(
+                int(target_details["target_passed_test_cases"])
+                if target_details is not None
+                else None
+            ),
+            target_failed_test_cases=(
+                int(target_details["target_failed_test_cases"])
+                if target_details is not None
+                else None
+            ),
+            target_test_case_pass_rate=(
+                float(target_details["target_test_case_pass_rate"])
+                if target_details is not None
+                else None
+            ),
+            target_passed_test_case_ids=(
+                list(target_details["target_passed_test_case_ids"])
+                if target_details is not None
+                else []
+            ),
+            target_failed_test_case_ids=(
+                list(target_details["target_failed_test_case_ids"])
+                if target_details is not None
+                else []
+            ),
             workspace_fingerprint=workspace_fingerprint,
         )
 
@@ -422,11 +635,18 @@ class CheckTool(ToolDefinition[CheckAction, CheckObservation]):
                     "This tool executes run_tests.py and computes f2p/p2p against "
                     "baseline_pass (commit0 baseline), which may be slow depending "
                     "on test cost. "
+                    "If run_tests.py supports optional --details-output and "
+                    "--details-target-file, this tool will collect target-file "
+                    "test-case-level details; otherwise it degrades to file-level only. "
                     "DO NOT call it repeatedly without meaningful code changes. "
-                    "You MUST provide record_id, repo, and depth. Test execution timeout "
-                    "is read from RUN_TESTS_TIMEOUT, and the tool writes per-round artifacts under "
-                    "/tmp/<repo_slug>/checks/<test_file_slug>/depth_<k>/check_<n>.txt "
-                    "and check_<n>.meta.json."
+                    "You MUST provide target_id only. "
+                    "Current candidate depth is read from the per-target conversation state. "
+                    "Host initializes it to 1 for each target flow, and save_tool advances it after each successful save. "
+                    "The concrete sample identity for this check round is "
+                    "record_id = {target_id}::depth=<current_depth>. "
+                    "Test execution timeout is read from RUN_TESTS_TIMEOUT, and the tool "
+                    "writes per-round artifacts under "
+                    "/output/records/<target_id_slug>/check/depth_<k>/turn_<n>/."
                 ),
                 action_type=CheckAction,
                 observation_type=CheckObservation,
