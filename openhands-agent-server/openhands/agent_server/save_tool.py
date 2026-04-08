@@ -1,4 +1,4 @@
-"""Save tool precheck scaffold for task-maker target/depth snapshots."""
+"""Save tool for task-maker target/depth snapshots."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from alpha.shared.record_id_codec import format_record_id
+from alpha.shared.target_test_details_schema import validate_target_details_payload
 from openhands.sdk import ImageContent, TextContent
 from openhands.sdk.tool import (
     Action,
@@ -163,6 +164,21 @@ def _find_latest_success_meta(*, check_dir: Path, target_id: str, depth: int) ->
             not isinstance(item, str) for item in p2p_raw
         ):
             raise ValueError(f"invalid check meta {meta_path}: p2p must be list[str]")
+        target_test_file_path = payload.get("target_test_file_path")
+        if (
+            not isinstance(target_test_file_path, str)
+            or not target_test_file_path.startswith("/testbed/")
+        ):
+            raise ValueError(
+                f"invalid check meta {meta_path}: target_test_file_path must start with /testbed/"
+            )
+        payload.update(
+            validate_target_details_payload(
+                payload,
+                expected_target_test_file_path=target_test_file_path,
+                error_prefix=f"invalid check meta {meta_path}",
+            )
+        )
         payload["workspace_fingerprint"] = workspace_fingerprint
         payload["f2p"] = sorted(set(f2p_raw))
         payload["p2p"] = sorted(set(p2p_raw))
@@ -255,8 +271,94 @@ def _write_save_output(task_record: "SaveTaskRecord") -> Path:
     return output_path
 
 
+def _build_issue_hint_prompt(
+    *,
+    gold_patch: str,
+) -> str:
+    return (
+        "You are labeling one saved feature-breaking diff.\n"
+        "Use the current conversation context and the diff below.\n"
+        'Return JSON only: {"issue": "...", "hint": "..."}\n\n'
+        "Rules:\n"
+        "1) issue: one concise natural-language description of the broken feature or capability that should be restored.\n"
+        "2) Focus on behavior/feature semantics, not tests, file names, patch operations, or line-level edits.\n"
+        "3) hint: one concise high-level restoration direction; do not reveal the exact fix.\n"
+        "4) If the diff affects multiple details, summarize the dominant broken feature.\n"
+        "5) Both values must be non-empty plain strings. No markdown fences and no extra text.\n\n"
+        "diff(commit0, commit_k):\n"
+        f"{gold_patch}"
+    )
+
+
+def _parse_issue_hint_response(response: str) -> tuple[str, str] | None:
+    response = response.strip()
+    if not response:
+        return None
+
+    payload = None
+    try:
+        payload = json.loads(response)
+    except json.JSONDecodeError:
+        start = response.find("{")
+        end = response.rfind("}")
+        if start != -1 and end != -1 and start < end:
+            try:
+                payload = json.loads(response[start : end + 1])
+            except json.JSONDecodeError:
+                return None
+        else:
+            return None
+
+    if not isinstance(payload, dict):
+        return None
+    issue = payload.get("issue")
+    hint = payload.get("hint")
+    if not isinstance(issue, str) or not issue.strip():
+        return None
+    if not isinstance(hint, str) or not hint.strip():
+        return None
+    return issue.strip(), hint.strip()
+
+
+def _generate_issue_hint_from_diff(
+    *,
+    conversation,
+    gold_patch: str,
+) -> tuple[str, str]:
+    if conversation is None or not hasattr(conversation, "ask_agent"):
+        raise RuntimeError("conversation.ask_agent is unavailable")
+
+    prompt = _build_issue_hint_prompt(
+        gold_patch=gold_patch,
+    )
+
+    had_error = False
+    last_error: str | None = None
+    last_response: str | None = None
+    for _ in range(3):
+        try:
+            response = conversation.ask_agent(prompt)
+        except Exception as exc:  # noqa: BLE001
+            had_error = True
+            last_error = str(exc)
+            continue
+        last_response = response
+        parsed = _parse_issue_hint_response(response)
+        if parsed is not None:
+            return parsed
+
+    if had_error:
+        raise RuntimeError(f"ask_agent error: {last_error}")
+    if last_response is not None:
+        preview = last_response.strip() or "(empty response)"
+        raise RuntimeError(f"failed to parse ask_agent response: {preview}")
+    raise RuntimeError("ask_agent returned no usable response")
+
+
 class SaveAction(Action):
-    target_id: str = Field(description="Stable target id: {repo}::{test_file_path}")
+    target_id: str = Field(
+        description="Current target id. Format: {repo}::{test_file_path}.",
+    )
 
 
 class SaveTaskRecord(BaseModel):
@@ -270,6 +372,12 @@ class SaveTaskRecord(BaseModel):
     issue: str
     depth: int
     hint: str
+    target_total_test_cases: int
+    target_passed_test_cases: int
+    target_failed_test_cases: int
+    target_test_case_pass_rate: float
+    target_passed_test_case_ids: list[str] = Field(default_factory=list)
+    target_failed_test_case_ids: list[str] = Field(default_factory=list)
 
 
 class SaveObservation(Observation):
@@ -279,16 +387,21 @@ class SaveObservation(Observation):
 
     @property
     def to_llm_content(self) -> Sequence[TextContent | ImageContent]:
-        status = "OK" if self.ok else "ERROR"
         summary = [
-            f"Save status: {status}",
-            f"Message: {self.message}",
+            f"save_ok: {str(self.ok).lower()}",
+            f"message: {self.message}",
         ]
         if self.task_record is not None:
             summary.append(f"target_id: {self.task_record.target_id}")
             summary.append(f"record_id: {self.task_record.record_id}")
             summary.append(f"depth: {self.task_record.depth}")
             summary.append(f"commit: {self.task_record.commit}")
+            summary.append(
+                f"target_total_test_cases: {self.task_record.target_total_test_cases}"
+            )
+            summary.append(
+                f"target_failed_test_cases: {self.task_record.target_failed_test_cases}"
+            )
         return [TextContent(text="\n".join(summary))]
 
 
@@ -459,6 +572,17 @@ class SaveExecutor(ToolExecutor[SaveAction, SaveObservation]):
         if not gold_patch.strip():
             return self._post_commit_failure(commit_k, "gold_patch is empty")
 
+        try:
+            issue, hint = _generate_issue_hint_from_diff(
+                conversation=conversation,
+                gold_patch=gold_patch,
+            )
+        except RuntimeError as exc:
+            return self._post_commit_failure(
+                commit_k,
+                f"issue/hint generation failed: {exc}",
+            )
+
         task_record = SaveTaskRecord(
             target_id=action.target_id,
             record_id=current_record_id,
@@ -467,9 +591,15 @@ class SaveExecutor(ToolExecutor[SaveAction, SaveObservation]):
             f2p=meta["f2p"],
             p2p=meta["p2p"],
             gold_patch=gold_patch,
-            issue="TODO(issue): placeholder",
+            issue=issue,
             depth=current_depth,
-            hint="TODO(hint): placeholder",
+            hint=hint,
+            target_total_test_cases=meta["target_total_test_cases"],
+            target_passed_test_cases=meta["target_passed_test_cases"],
+            target_failed_test_cases=meta["target_failed_test_cases"],
+            target_test_case_pass_rate=meta["target_test_case_pass_rate"],
+            target_passed_test_case_ids=meta["target_passed_test_case_ids"],
+            target_failed_test_case_ids=meta["target_failed_test_case_ids"],
         )
         try:
             _write_save_output(task_record)
@@ -496,18 +626,11 @@ class SaveTool(ToolDefinition[SaveAction, SaveObservation]):
         return [
             cls(
                 description=(
-                    "Save current depth snapshot for task-maker. "
+                    "Save the current target/depth snapshot. "
                     "Input requires target_id only. "
-                    "Current candidate depth is read from the per-target conversation state. "
-                    "Host initializes it to 1 for each target flow, and save_tool advances it after each successful save. "
-                    "A successful save materializes one concrete sample identity "
-                    "record_id = {target_id}::depth=<current_depth>. "
-                    "This version runs prechecks, commits workspace changes, and "
-                    "produces gold_patch from diff(commit0, commit_k). It uses "
-                    "post_commit_failure semantics if failures happen after commit. "
-                    "Successful saves write /output/records/<target_id_slug>/save/depth_<k>/save.json. "
-                    "Task DB persistence is performed by host-side task_maker ingest "
-                    "(not inside save_tool). issue/hint are currently placeholder values."
+                    "The tool reads current_depth from shared runtime state, requires a matching successful check for the same target and depth, and requires the workspace to still match that checked snapshot. "
+                    "On success it commits current /testbed changes, builds gold_patch from diff(commit0, commit_k), generates issue/hint from the saved diff, writes /output/records/<target_id_slug>/save/depth_<k>/save.json, and advances to the next depth. "
+                    "If a failure happens after commit, the tool returns post_commit_failure."
                 ),
                 action_type=SaveAction,
                 observation_type=SaveObservation,

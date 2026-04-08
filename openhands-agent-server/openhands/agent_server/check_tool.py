@@ -147,7 +147,15 @@ def _parse_result_text_at_least_one_header(text: str) -> tuple[list[str], list[s
         raise ValueError(
             "Invalid result format: expected at least one of passed/failed headers"
         )
-    return sorted(set(passed_paths)), sorted(set(failed_paths))
+    passed_paths = sorted(set(passed_paths))
+    failed_paths = sorted(set(failed_paths))
+    overlap = sorted(set(passed_paths) & set(failed_paths))
+    if overlap:
+        raise ValueError(
+            "Invalid result format: the same test file appears in both passed and "
+            f"failed sections: {', '.join(overlap)}"
+        )
+    return passed_paths, failed_paths
 
 def _load_target_details(
     details_path: Path,
@@ -269,7 +277,9 @@ def _write_check_meta(
 
 
 class CheckAction(Action):
-    target_id: str = Field(description="Stable target id: {repo}::{test_file_path}")
+    target_id: str = Field(
+        description="Current target id. Format: {repo}::{test_file_path}.",
+    )
 
 
 class CheckObservation(Observation):
@@ -294,10 +304,9 @@ class CheckObservation(Observation):
 
     @property
     def to_llm_content(self) -> Sequence[TextContent | ImageContent]:
-        status = "OK" if self.ok else "ERROR"
         summary = [
-            f"Check status: {status}",
-            f"Message: {self.message}",
+            f"check_ok: {str(self.ok).lower()}",
+            f"message: {self.message}",
             f"target_id: {self.target_id}",
         ]
         if self.record_id:
@@ -629,24 +638,11 @@ class CheckTool(ToolDefinition[CheckAction, CheckObservation]):
         return [
             cls(
                 description=(
-                    "Before calling this tool, you MUST ensure depth=0 baseline has "
-                    "been prepared for this repo and your latest code edits are ready "
-                    "for validation. "
-                    "This tool executes run_tests.py and computes f2p/p2p against "
-                    "baseline_pass (commit0 baseline), which may be slow depending "
-                    "on test cost. "
-                    "If run_tests.py supports optional --details-output and "
-                    "--details-target-file, this tool will collect target-file "
-                    "test-case-level details; otherwise it degrades to file-level only. "
-                    "DO NOT call it repeatedly without meaningful code changes. "
-                    "You MUST provide target_id only. "
-                    "Current candidate depth is read from the per-target conversation state. "
-                    "Host initializes it to 1 for each target flow, and save_tool advances it after each successful save. "
-                    "The concrete sample identity for this check round is "
-                    "record_id = {target_id}::depth=<current_depth>. "
-                    "Test execution timeout is read from RUN_TESTS_TIMEOUT, and the tool "
-                    "writes per-round artifacts under "
-                    "/output/records/<target_id_slug>/check/depth_<k>/turn_<n>/."
+                    "Validate the current target at the current depth. "
+                    "Input requires target_id only. "
+                    "The tool reads current_depth from shared runtime state, executes run_tests.py, validates both file-level output and target-file details output, computes f2p/p2p against baseline_pass, and writes per-round artifacts under /output/records/<target_id_slug>/check/depth_<k>/turn_<n>/. "
+                    "Each successful check corresponds to record_id = {target_id}::depth=<current_depth>. "
+                    "Do not call it repeatedly without meaningful code changes."
                 ),
                 action_type=CheckAction,
                 observation_type=CheckObservation,
