@@ -314,10 +314,23 @@ class CheckObservation(Observation):
         summary.extend(
             [
             f"depth: {self.depth}",
-            f"f2p_count: {len(self.f2p)}",
-            f"p2p_count: {len(self.p2p)}",
-            f"target_file_failed: {self.target_file_failed}",
-            f"other_failed_test_file_count: {self.other_failed_test_file_count}",
+            (
+                "f2p_count: "
+                f"{len(self.f2p)} (baseline-pass test files that now fail)"
+            ),
+            (
+                "p2p_count: "
+                f"{len(self.p2p)} (baseline-pass test files that still pass)"
+            ),
+            (
+                "target_file_failed: "
+                f"{self.target_file_failed} (whether the current target file is now in f2p)"
+            ),
+            (
+                "other_failed_test_file_count: "
+                f"{self.other_failed_test_file_count} "
+                "(failed baseline-pass test files other than the current target)"
+            ),
             ]
         )
         if self.target_test_file_path:

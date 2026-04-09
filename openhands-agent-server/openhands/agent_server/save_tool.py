@@ -280,11 +280,10 @@ def _build_issue_hint_prompt(
         "Use the current conversation context and the diff below.\n"
         'Return JSON only: {"issue": "...", "hint": "..."}\n\n'
         "Rules:\n"
-        "1) issue: one concise natural-language description of the broken feature or capability that should be restored.\n"
-        "2) Focus on behavior/feature semantics, not tests, file names, patch operations, or line-level edits.\n"
-        "3) hint: one concise high-level restoration direction; do not reveal the exact fix.\n"
-        "4) If the diff affects multiple details, summarize the dominant broken feature.\n"
-        "5) Both values must be non-empty plain strings. No markdown fences and no extra text.\n\n"
+        "1) issue: a concise natural-language description of the broken functionality that should be restored. If multiple related behaviors or feature areas are broken, describe them together briefly.\n"
+        "2) Focus on behavior and functionality, not tests, file names, patch operations, or line-level edits.\n"
+        "3) hint: a concise high-level restoration direction; do not reveal the exact fix.\n"
+        "4) Both values must be non-empty plain strings. No markdown fences and no extra text.\n\n"
         "diff(commit0, commit_k):\n"
         f"{gold_patch}"
     )
